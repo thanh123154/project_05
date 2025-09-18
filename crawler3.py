@@ -239,26 +239,26 @@ def load_urls_from_tld_grouped(path: str = TLD_GROUPED_JSON) -> List[UrlRecord]:
                                     url=url,
                                     source_collection=collection
                                 ))
-            elif isinstance(product_data, list):
-                # Nếu product_data là list các URLs
-                for url_info in product_data:
-                    if isinstance(url_info, dict):
-                        url = url_info.get("url") or url_info.get(
-                            "current_url") or url_info.get("referrer_url")
-                        collection = url_info.get("collection", "unknown")
-                        if url:
+                elif isinstance(product_data, list):
+                    # Nếu product_data là list các URLs
+                    for url_info in product_data:
+                        if isinstance(url_info, dict):
+                            url = url_info.get("url") or url_info.get(
+                                "current_url") or url_info.get("referrer_url")
+                            collection = url_info.get("collection", "unknown")
+                            if url:
+                                records.append(UrlRecord(
+                                    product_id=product_id,
+                                    url=url,
+                                    source_collection=collection
+                                ))
+                        elif isinstance(url_info, str):
+                            # Nếu chỉ là string URL
                             records.append(UrlRecord(
                                 product_id=product_id,
-                                url=url,
-                                source_collection=collection
+                                url=url_info,
+                                source_collection="unknown"
                             ))
-                    elif isinstance(url_info, str):
-                        # Nếu chỉ là string URL
-                        records.append(UrlRecord(
-                            product_id=product_id,
-                            url=url_info,
-                            source_collection="unknown"
-                        ))
 
         logger.info(f"✅ Loaded {len(records)} URL records from {path}")
     except FileNotFoundError:
