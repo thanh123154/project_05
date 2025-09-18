@@ -204,20 +204,41 @@ def load_urls_from_tld_grouped(path: str = TLD_GROUPED_JSON) -> List[UrlRecord]:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Giả sử cấu trúc file là dict với các key là product_id và value chứa URLs
-        for product_id, product_data in data.items():
-            if isinstance(product_data, dict) and "urls" in product_data:
-                for url_info in product_data["urls"]:
-                    if isinstance(url_info, dict):
-                        url = url_info.get("url") or url_info.get(
-                            "current_url") or url_info.get("referrer_url")
-                        collection = url_info.get("collection", "unknown")
-                        if url:
-                            records.append(UrlRecord(
-                                product_id=product_id,
-                                url=url,
-                                source_collection=collection
-                            ))
+        # Kiểm tra cấu trúc dữ liệu
+        if isinstance(data, list):
+            # Nếu data là array (list) - cấu trúc thực tế của file
+            logger.info("📋 Detected array structure in JSON file")
+            for item in data:
+                if isinstance(item, dict):
+                    product_id = item.get("product_id", "unknown")
+                    current_urls = item.get("current_url", {})
+
+                    # Lặp qua các country codes (es, de, etc.)
+                    for country, urls in current_urls.items():
+                        if isinstance(urls, list):
+                            for url in urls:
+                                if url and isinstance(url, str):
+                                    records.append(UrlRecord(
+                                        product_id=str(product_id),
+                                        url=url,
+                                        source_collection=f"view_product_detail_{country}"
+                                    ))
+        elif isinstance(data, dict):
+            # Nếu data là object (dict) - fallback cho cấu trúc khác
+            logger.info("📋 Detected object structure in JSON file")
+            for product_id, product_data in data.items():
+                if isinstance(product_data, dict) and "urls" in product_data:
+                    for url_info in product_data["urls"]:
+                        if isinstance(url_info, dict):
+                            url = url_info.get("url") or url_info.get(
+                                "current_url") or url_info.get("referrer_url")
+                            collection = url_info.get("collection", "unknown")
+                            if url:
+                                records.append(UrlRecord(
+                                    product_id=product_id,
+                                    url=url,
+                                    source_collection=collection
+                                ))
             elif isinstance(product_data, list):
                 # Nếu product_data là list các URLs
                 for url_info in product_data:
