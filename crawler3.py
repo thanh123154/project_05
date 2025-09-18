@@ -42,6 +42,7 @@ MAX_WORKERS = 30
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
 URLS_JSONL = "product_urls.jsonl"  # File lưu URLs trước khi crawl
+TLD_GROUPED_JSON = "tld_grouped.json"  # File dữ liệu có sẵn
 BATCH_SIZE = 10000
 MAX_PRODUCTS = 1000
 
@@ -196,6 +197,56 @@ def write_urls_jsonl(url_records: List[UrlRecord], path: str = URLS_JSONL) -> No
     logger.info(f"✅ Saved {len(url_records)} URL records to {path}")
 
 
+def load_urls_from_tld_grouped(path: str = TLD_GROUPED_JSON) -> List[UrlRecord]:
+    """Load URL records từ file tld_grouped.json có sẵn"""
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Giả sử cấu trúc file là dict với các key là product_id và value chứa URLs
+        for product_id, product_data in data.items():
+            if isinstance(product_data, dict) and "urls" in product_data:
+                for url_info in product_data["urls"]:
+                    if isinstance(url_info, dict):
+                        url = url_info.get("url") or url_info.get(
+                            "current_url") or url_info.get("referrer_url")
+                        collection = url_info.get("collection", "unknown")
+                        if url:
+                            records.append(UrlRecord(
+                                product_id=product_id,
+                                url=url,
+                                source_collection=collection
+                            ))
+            elif isinstance(product_data, list):
+                # Nếu product_data là list các URLs
+                for url_info in product_data:
+                    if isinstance(url_info, dict):
+                        url = url_info.get("url") or url_info.get(
+                            "current_url") or url_info.get("referrer_url")
+                        collection = url_info.get("collection", "unknown")
+                        if url:
+                            records.append(UrlRecord(
+                                product_id=product_id,
+                                url=url,
+                                source_collection=collection
+                            ))
+                    elif isinstance(url_info, str):
+                        # Nếu chỉ là string URL
+                        records.append(UrlRecord(
+                            product_id=product_id,
+                            url=url_info,
+                            source_collection="unknown"
+                        ))
+
+        logger.info(f"✅ Loaded {len(records)} URL records from {path}")
+    except FileNotFoundError:
+        logger.warning(f"⚠️ File {path} not found")
+    except Exception as e:
+        logger.error(f"❌ Error loading URLs from {path}: {e}")
+    return records
+
+
 def load_urls_from_jsonl(path: str = URLS_JSONL) -> List[UrlRecord]:
     """Load URL records từ file JSONL"""
     records = []
@@ -233,8 +284,20 @@ def write_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
 def main():
     import os
 
-    # Kiểm tra xem file URLs đã tồn tại chưa
-    if os.path.exists(URLS_JSONL):
+    # Debug: liệt kê tất cả file trong thư mục
+    logger.info(f"🔍 Current directory: {os.getcwd()}")
+    logger.info(f"🔍 Looking for file: {TLD_GROUPED_JSON}")
+    logger.info(f"🔍 Files in directory: {os.listdir('.')}")
+
+    # Ưu tiên đọc từ file tld_grouped.json có sẵn
+    if os.path.exists(TLD_GROUPED_JSON):
+        logger.info(f"📁 Found existing data file: {TLD_GROUPED_JSON}")
+        url_records = load_urls_from_tld_grouped()
+        if not url_records:
+            logger.warning("⚠️ No URLs found in tld_grouped.json")
+            sys.exit(1)
+    # Fallback: kiểm tra file URLs đã lưu
+    elif os.path.exists(URLS_JSONL):
         logger.info(f"📁 Found existing URLs file: {URLS_JSONL}")
         url_records = load_urls_from_jsonl()
         if not url_records:
@@ -248,7 +311,7 @@ def main():
             url_records = fetch_unique_product_urls()
             write_urls_jsonl(url_records)
     else:
-        logger.info("🔄 No URLs file found, fetching from MongoDB...")
+        logger.info("🔄 No data files found, fetching from MongoDB...")
         try:
             _get_mongo_client().admin.command("ping")
             logger.info("✅ Connected to MongoDB")
