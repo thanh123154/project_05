@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 import requests
 from bs4 import BeautifulSoup
 import pymongo
+import os
 
 # -----------------------------
 # Configurations
@@ -39,12 +40,11 @@ USER_AGENTS = [
 ]
 
 MAX_WORKERS = 30
+BATCH_SIZE = 1000   # số lượng product xử lý 1 lần
+URLS_PER_PRODUCT = 20
+
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
-URLS_JSONL = "product_urls.jsonl"  # File lưu URLs trước khi crawl
-TLD_GROUPED_JSON = "tld_grouped.json"  # File dữ liệu có sẵn
-BATCH_SIZE = 10000
-MAX_PRODUCTS = 1000
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -77,9 +77,9 @@ def _safe_str(value: object) -> Optional[str]:
     return str(value).strip() or None
 
 
-def get_unique_product_ids() -> List[str]:
-    client = _get_mongo_client()
-    col = client[DB_NAME][SOURCE_COLLECTION]
+def stream_product_ids(batch_size=1000):
+    """Stream product IDs theo batch để tránh tràn RAM"""
+    col = _get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
 
     pipeline = [
         {"$match": {
@@ -93,13 +93,18 @@ def get_unique_product_ids() -> List[str]:
             "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
         {"$group": {"_id": "$pid"}},
         {"$sort": {"_id": 1}},
-        # {"$limit": MAX_PRODUCTS}
     ]
 
-    product_ids = [r["_id"]
-                   for r in col.aggregate(pipeline, allowDiskUse=True)]
-    logger.info(f"✅ Found {len(product_ids)} unique product IDs")
-    return product_ids
+    cursor = col.aggregate(pipeline, allowDiskUse=True)
+
+    batch = []
+    for doc in cursor:
+        batch.append(doc["_id"])
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def get_urls_for_product(product_id: str, limit: int = 10) -> List[UrlRecord]:
@@ -119,15 +124,6 @@ def get_urls_for_product(product_id: str, limit: int = 10) -> List[UrlRecord]:
             if len(url_records) >= limit:
                 break
     return url_records
-
-
-def fetch_unique_product_urls() -> List[UrlRecord]:
-    product_ids = get_unique_product_ids()
-    all_records = []
-    for pid in tqdm(product_ids, desc="Fetching URLs"):
-        all_records.extend(get_urls_for_product(pid, limit=20))
-    logger.info(f"✅ Collected {len(all_records)} URL records")
-    return all_records
 
 
 def http_get(url: str) -> Optional[str]:
@@ -184,171 +180,40 @@ def deduplicate_by_product_id(candidates: List[Dict]) -> List[Dict]:
     return list(deduped.values())
 
 
-def write_urls_jsonl(url_records: List[UrlRecord], path: str = URLS_JSONL) -> None:
-    """Lưu tất cả URL records ra file JSONL trước khi crawl"""
-    with open(path, "w", encoding="utf-8") as f:
-        for record in url_records:
-            row = {
-                "product_id": record.product_id,
-                "url": record.url,
-                "source_collection": record.source_collection
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    logger.info(f"✅ Saved {len(url_records)} URL records to {path}")
-
-
-def load_urls_from_tld_grouped(path: str = TLD_GROUPED_JSON) -> List[UrlRecord]:
-    """Load URL records từ file tld_grouped.json có sẵn"""
-    records = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Kiểm tra cấu trúc dữ liệu
-        if isinstance(data, list):
-            # Nếu data là array (list) - cấu trúc thực tế của file
-            logger.info("📋 Detected array structure in JSON file")
-            for item in data:
-                if isinstance(item, dict):
-                    product_id = item.get("product_id", "unknown")
-                    current_urls = item.get("current_url", {})
-
-                    # Lặp qua các country codes (es, de, etc.)
-                    for country, urls in current_urls.items():
-                        if isinstance(urls, list):
-                            for url in urls:
-                                if url and isinstance(url, str):
-                                    records.append(UrlRecord(
-                                        product_id=str(product_id),
-                                        url=url,
-                                        source_collection=f"view_product_detail_{country}"
-                                    ))
-        elif isinstance(data, dict):
-            # Nếu data là object (dict) - fallback cho cấu trúc khác
-            logger.info("📋 Detected object structure in JSON file")
-            for product_id, product_data in data.items():
-                if isinstance(product_data, dict) and "urls" in product_data:
-                    for url_info in product_data["urls"]:
-                        if isinstance(url_info, dict):
-                            url = url_info.get("url") or url_info.get(
-                                "current_url") or url_info.get("referrer_url")
-                            collection = url_info.get("collection", "unknown")
-                            if url:
-                                records.append(UrlRecord(
-                                    product_id=product_id,
-                                    url=url,
-                                    source_collection=collection
-                                ))
-                elif isinstance(product_data, list):
-                    # Nếu product_data là list các URLs
-                    for url_info in product_data:
-                        if isinstance(url_info, dict):
-                            url = url_info.get("url") or url_info.get(
-                                "current_url") or url_info.get("referrer_url")
-                            collection = url_info.get("collection", "unknown")
-                            if url:
-                                records.append(UrlRecord(
-                                    product_id=product_id,
-                                    url=url,
-                                    source_collection=collection
-                                ))
-                        elif isinstance(url_info, str):
-                            # Nếu chỉ là string URL
-                            records.append(UrlRecord(
-                                product_id=product_id,
-                                url=url_info,
-                                source_collection="unknown"
-                            ))
-
-        logger.info(f"✅ Loaded {len(records)} URL records from {path}")
-    except FileNotFoundError:
-        logger.warning(f"⚠️ File {path} not found")
-    except Exception as e:
-        logger.error(f"❌ Error loading URLs from {path}: {e}")
-    return records
-
-
-def load_urls_from_jsonl(path: str = URLS_JSONL) -> List[UrlRecord]:
-    """Load URL records từ file JSONL"""
-    records = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                data = json.loads(line.strip())
-                records.append(UrlRecord(
-                    product_id=data["product_id"],
-                    url=data["url"],
-                    source_collection=data["source_collection"]
-                ))
-        logger.info(f"✅ Loaded {len(records)} URL records from {path}")
-    except FileNotFoundError:
-        logger.warning(f"⚠️ File {path} not found")
-    except Exception as e:
-        logger.error(f"❌ Error loading URLs from {path}: {e}")
-    return records
-
-
-def write_candidates_jsonl(candidates: List[Dict], path: str = CANDIDATES_JSONL) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+def append_candidates_jsonl(candidates: List[Dict], path: str = CANDIDATES_JSONL) -> None:
+    with open(path, "a", encoding="utf-8") as f:
         for row in candidates:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def write_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as f:
+def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
+    file_exists = os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
                                 "product_id", "product_name", "url", "source_collection", "fetched_at"])
-        writer.writeheader()
+        if not file_exists:
+            writer.writeheader()
         writer.writerows(candidates)
 
 
 def main():
-    import os
+    total_products = 0
+    for batch in stream_product_ids(batch_size=BATCH_SIZE):
+        logger.info(f"🔄 Processing batch with {len(batch)} product IDs...")
+        url_records = []
+        for pid in batch:
+            url_records.extend(get_urls_for_product(
+                pid, limit=URLS_PER_PRODUCT))
 
-    # Debug: liệt kê tất cả file trong thư mục
-    logger.info(f"🔍 Current directory: {os.getcwd()}")
-    logger.info(f"🔍 Looking for file: {TLD_GROUPED_JSON}")
-    logger.info(f"🔍 Files in directory: {os.listdir('.')}")
+        candidates = crawl_product_names_parallel(url_records)
+        deduped = deduplicate_by_product_id(candidates)
 
-    # Ưu tiên đọc từ file tld_grouped.json có sẵn
-    if os.path.exists(TLD_GROUPED_JSON):
-        logger.info(f"📁 Found existing data file: {TLD_GROUPED_JSON}")
-        url_records = load_urls_from_tld_grouped()
-        if not url_records:
-            logger.warning("⚠️ No URLs found in tld_grouped.json")
-            sys.exit(1)
-    # Fallback: kiểm tra file URLs đã lưu
-    elif os.path.exists(URLS_JSONL):
-        logger.info(f"📁 Found existing URLs file: {URLS_JSONL}")
-        url_records = load_urls_from_jsonl()
-        if not url_records:
-            logger.info("🔄 URLs file empty, fetching from MongoDB...")
-            try:
-                _get_mongo_client().admin.command("ping")
-                logger.info("✅ Connected to MongoDB")
-            except Exception as e:
-                logger.error(f"❌ Cannot connect to MongoDB: {e}")
-                sys.exit(1)
-            url_records = fetch_unique_product_urls()
-            write_urls_jsonl(url_records)
-    else:
-        logger.info("🔄 No data files found, fetching from MongoDB...")
-        try:
-            _get_mongo_client().admin.command("ping")
-            logger.info("✅ Connected to MongoDB")
-        except Exception as e:
-            logger.error(f"❌ Cannot connect to MongoDB: {e}")
-            sys.exit(1)
-        url_records = fetch_unique_product_urls()
-        write_urls_jsonl(url_records)
+        append_candidates_jsonl(deduped)
+        append_final_csv(deduped)
 
-    # Crawl product names từ URLs đã lưu
-    logger.info("🕷️ Starting to crawl product names...")
-    candidates = crawl_product_names_parallel(url_records)
-    deduped = deduplicate_by_product_id(candidates)
-    write_candidates_jsonl(deduped)
-    write_final_csv(deduped)
-    logger.info(f"✅ Done! Processed {len(deduped)} unique products")
+        total_products += len(deduped)
+        logger.info(
+            f"✅ Finished batch. Total processed so far: {total_products}")
 
 
 if __name__ == "__main__":
