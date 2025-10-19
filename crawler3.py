@@ -90,21 +90,37 @@ def stream_product_ids(batch_size=1000):
             ]
         }},
         {"$project": {
-            "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
-        {"$group": {"_id": "$pid"}},
-        {"$sort": {"_id": 1}},
+            "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}}
     ]
 
     cursor = col.aggregate(pipeline, allowDiskUse=True)
 
     batch = []
     for doc in cursor:
-        batch.append(doc["_id"])
+        batch.append(doc["pid"])
         if len(batch) >= batch_size:
             yield batch
             batch = []
     if batch:
         yield batch
+
+
+def count_total_products():
+    col = _get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
+    pipeline = [
+        {"$match": {
+            "collection": {"$in": TARGET_EVENT_TYPES},
+            "$or": [
+                {"product_id": {"$exists": True, "$ne": None, "$type": "string"}},
+                {"viewing_product_id": {"$exists": True, "$ne": None, "$type": "string"}}
+            ]
+        }},
+        {"$project": {"pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
+        {"$group": {"_id": "$pid"}},
+        {"$count": "total"}
+    ]
+    result = list(col.aggregate(pipeline))
+    return result[0]["total"] if result else 0
 
 
 def get_urls_for_product(product_id: str, limit: int = 10) -> List[UrlRecord]:
@@ -233,7 +249,12 @@ def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
 
 
 def main():
-    total_products = 0
+    total_expected = count_total_products()
+    logger.info(f"📊 Total product IDs expected: {total_expected}")
+
+    total_processed = 0
+    total_with_name = 0
+
     for batch in stream_product_ids(batch_size=BATCH_SIZE):
         logger.info(f"🔄 Processing batch with {len(batch)} product IDs...")
         url_records = []
@@ -247,9 +268,19 @@ def main():
         append_candidates_jsonl(deduped)
         append_final_csv(deduped)
 
-        total_products += len(deduped)
+        processed_batch = len(deduped)
+        with_name_batch = sum(1 for row in deduped if row.get("product_name"))
+
+        total_processed += processed_batch
+        total_with_name += with_name_batch
+
+        percent = (total_processed / total_expected) * 100 if total_expected else 0
         logger.info(
-            f"✅ Finished batch. Total processed so far: {total_products}")
+            f"✅ Finished batch. Total processed: {total_processed}/{total_expected} "
+            f"({percent:.2f}% done). With product_name: {total_with_name}"
+        )
+
+    logger.info(f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
 
 
 if __name__ == "__main__":
