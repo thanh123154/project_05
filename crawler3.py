@@ -162,12 +162,48 @@ def process_single_url(record: UrlRecord) -> Dict:
 
 def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     results = []
+    total = len(records)
+    completed = 0
+
+    # Try to create a tqdm progress bar if available; gracefully fallback otherwise
+    progress = None
+    has_progress_update = False
+    try:
+        progress = tqdm(total=total, desc="Crawling products")
+        has_progress_update = hasattr(progress, "update")
+    except TypeError:
+        progress = None
+        has_progress_update = False
+
+    log_every = max(1, total // 20) if total > 0 else 1  # ~5% steps
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for future in as_completed(executor.submit(process_single_url, r) for r in records):
             try:
                 results.append(future.result())
             except Exception as e:
                 logger.warning(f"Error: {e}")
+            finally:
+                completed += 1
+                if has_progress_update and progress is not None:
+                    try:
+                        progress.update(1)
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: periodic percentage logging via logger
+                    if completed % log_every == 0 or completed == total:
+                        percent = (completed * 100.0 /
+                                   total) if total else 100.0
+                        logger.info(
+                            f"⏳ Progress: {completed}/{total} ({percent:.1f}%)")
+
+    if progress is not None and hasattr(progress, "close"):
+        try:
+            progress.close()
+        except Exception:
+            pass
+
     return results
 
 
