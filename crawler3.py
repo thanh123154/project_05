@@ -16,7 +16,7 @@ import os
 # -----------------------------
 # Configurations
 # -----------------------------
-MONGO_URI = "mongodb://myUserAdmin:Cunmiu123@127.0.0.1:27017/?authSource=admin"
+MONGO_URI = "mongodb://127.0.0.1:27017/"
 DB_NAME = "glamira"
 SOURCE_COLLECTION = "summary"
 
