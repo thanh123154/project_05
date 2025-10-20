@@ -30,18 +30,18 @@ TARGET_EVENT_TYPES = [
     "product_view_all_recommend_clicked",
 ]
 
-DEFAULT_TIMEOUT_SECONDS = 10
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE_SECONDS = 1.5
+DEFAULT_TIMEOUT_SECONDS = 5
+MAX_RETRIES = 2
+RETRY_BACKOFF_BASE_SECONDS = 1
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
-MAX_WORKERS = 30
+MAX_WORKERS = 50
 BATCH_SIZE = 1000   # số lượng product xử lý 1 lần
-URLS_PER_PRODUCT = 20
+URLS_PER_PRODUCT = 10
 
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
@@ -57,6 +57,23 @@ except ImportError:
         for i, item in enumerate(iterable):
             yield item
 
+# -----------------------------
+# Global MongoClient
+# -----------------------------
+mongo_client = None
+
+
+def get_mongo_client() -> pymongo.MongoClient:
+    global mongo_client
+    if mongo_client is None:
+        mongo_client = pymongo.MongoClient(
+            MONGO_URI, serverSelectionTimeoutMS=10000)
+    return mongo_client
+
+# -----------------------------
+# Dataclasses
+# -----------------------------
+
 
 @dataclass
 class UrlRecord:
@@ -64,9 +81,9 @@ class UrlRecord:
     url: str
     source_collection: str
 
-
-def _get_mongo_client() -> pymongo.MongoClient:
-    return pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+# -----------------------------
+# Helper Functions
+# -----------------------------
 
 
 def _safe_str(value: object) -> Optional[str]:
@@ -79,7 +96,7 @@ def _safe_str(value: object) -> Optional[str]:
 
 def stream_product_ids(batch_size=1000):
     """Stream product IDs theo batch để tránh tràn RAM"""
-    col = _get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
+    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
 
     pipeline = [
         {"$match": {
@@ -106,7 +123,7 @@ def stream_product_ids(batch_size=1000):
 
 
 def count_total_products():
-    col = _get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
+    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
     pipeline = [
         {"$match": {
             "collection": {"$in": TARGET_EVENT_TYPES},
@@ -115,7 +132,8 @@ def count_total_products():
                 {"viewing_product_id": {"$exists": True, "$ne": None, "$type": "string"}}
             ]
         }},
-        {"$project": {"pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
+        {"$project": {
+            "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
         {"$group": {"_id": "$pid"}},
         {"$count": "total"}
     ]
@@ -123,23 +141,23 @@ def count_total_products():
     return result[0]["total"] if result else 0
 
 
-def get_urls_for_product(product_id: str, limit: int = 10) -> List[UrlRecord]:
-    col = _get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
+def get_urls_for_product(product_id: str, limit: int = URLS_PER_PRODUCT) -> List[UrlRecord]:
+    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
     query = {
         "$or": [{"product_id": product_id}, {"viewing_product_id": product_id}],
         "collection": {"$in": TARGET_EVENT_TYPES},
     }
-    url_records, seen_urls = [], set()
-    for doc in col.find(query, {"current_url": 1, "referrer_url": 1, "collection": 1}).limit(limit * 2):
-        collection = doc.get("collection")
-        url = _safe_str(doc.get("referrer_url") if collection ==
-                        "product_view_all_recommend_clicked" else doc.get("current_url"))
-        if url and url not in seen_urls:
-            url_records.append(UrlRecord(product_id, url, collection))
-            seen_urls.add(url)
-            if len(url_records) >= limit:
-                break
-    return url_records
+
+    urls = col.distinct(
+        "current_url",
+        query
+    )[:limit]
+
+    records = []
+    for url in urls:
+        records.append(
+            UrlRecord(product_id, _safe_str(url), SOURCE_COLLECTION))
+    return records
 
 
 def http_get(url: str) -> Optional[str]:
@@ -181,20 +199,18 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     total = len(records)
     completed = 0
 
-    # Try to create a tqdm progress bar if available; gracefully fallback otherwise
-    progress = None
-    has_progress_update = False
     try:
         progress = tqdm(total=total, desc="Crawling products")
         has_progress_update = hasattr(progress, "update")
-    except TypeError:
+    except Exception:
         progress = None
         has_progress_update = False
 
     log_every = max(1, total // 20) if total > 0 else 1  # ~5% steps
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for future in as_completed(executor.submit(process_single_url, r) for r in records):
+        futures = [executor.submit(process_single_url, r) for r in records]
+        for future in as_completed(futures):
             try:
                 results.append(future.result())
             except Exception as e:
@@ -207,7 +223,6 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
                     except Exception:
                         pass
                 else:
-                    # Fallback: periodic percentage logging via logger
                     if completed % log_every == 0 or completed == total:
                         percent = (completed * 100.0 /
                                    total) if total else 100.0
@@ -247,15 +262,32 @@ def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
             writer.writeheader()
         writer.writerows(candidates)
 
+# -----------------------------
+# Main
+# -----------------------------
+
 
 def main():
     total_expected = count_total_products()
     logger.info(f"📊 Total product IDs expected: {total_expected}")
 
+    # Load existing processed products
+    existing_pids = set()
+    if os.path.exists(FINAL_CSV):
+        with open(FINAL_CSV, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_pids.add(row["product_id"])
+
     total_processed = 0
     total_with_name = 0
 
     for batch in stream_product_ids(batch_size=BATCH_SIZE):
+        # Skip already processed
+        batch = [pid for pid in batch if pid not in existing_pids]
+        if not batch:
+            continue
+
         logger.info(f"🔄 Processing batch with {len(batch)} product IDs...")
         url_records = []
         for pid in batch:
@@ -274,13 +306,15 @@ def main():
         total_processed += processed_batch
         total_with_name += with_name_batch
 
-        percent = (total_processed / total_expected) * 100 if total_expected else 0
+        percent = (total_processed / total_expected) * \
+            100 if total_expected else 0
         logger.info(
             f"✅ Finished batch. Total processed: {total_processed}/{total_expected} "
             f"({percent:.2f}% done). With product_name: {total_with_name}"
         )
 
-    logger.info(f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
+    logger.info(
+        f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
 
 
 if __name__ == "__main__":
