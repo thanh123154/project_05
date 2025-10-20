@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-IP Location Processing Script (No Authorization)
-Processes unique IPs from MongoDB collection and enriches with location data using IP2Location.
+Optimized IP Location Processing Script with Timing
+Processes unique IPs from MongoDB and enriches with location data using IP2Location.
 """
 
 import sys
@@ -11,41 +11,35 @@ import time
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import os
 
 import pymongo
 from IP2Location import IP2Location
+from tqdm import tqdm
 
 # -----------------------------
 # Configurations
 # -----------------------------
-MONGO_URI = "mongodb://127.0.0.1:27017/"  # ⚠️ No username/password
+MONGO_URI = "mongodb://127.0.0.1:27017/"
 DB_NAME = "countly"
 SOURCE_COLLECTION = "summary"
 TARGET_COLLECTION = "ip_locations"
 IP2LOCATION_DB_PATH = "IP2LOCATION-LITE-DB1.BIN"
 
-# Output files
 CSV_OUTPUT = "ip_locations.csv"
 JSONL_OUTPUT = "ip_locations.jsonl"
 
-# Processing settings
-BATCH_SIZE = 1000
-MAX_WORKERS = 10
-LOG_EVERY = 100
+BATCH_SIZE = 500  # Mongo insert batch size
+MAX_WORKERS = max(1, multiprocessing.cpu_count() - 1)
+RETRY_COUNT = 2
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, desc=None, total=None):
-        for item in iterable:
-            yield item
 
 
 @dataclass
@@ -58,46 +52,19 @@ class IPLocationData:
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     processed_at: Optional[int] = None
+    processing_time_ms: Optional[float] = None  # time to get this IP location
 
 
-class IPLocationProcessor:
-    def __init__(self, db_path: str = IP2LOCATION_DB_PATH):
-        try:
-            self.ip2location = IP2Location(db_path)
-            logger.info(f"✅ IP2Location database loaded from {db_path}")
-        except Exception as e:
-            logger.error(f"❌ Failed to load IP2Location DB: {e}")
-            sys.exit(1)
-
-    def get_location_data(self, ip: str) -> IPLocationData:
-        """Get location data for a single IP."""
-        try:
-            result = self.ip2location.get_all(ip)
-            return IPLocationData(
-                ip=ip,
-                country_code=result.country_short,
-                country_name=result.country_long,
-                region_name=result.region,
-                city_name=result.city,
-                latitude=float(result.latitude),
-                longitude=float(result.longitude),
-                processed_at=int(time.time())
-            )
-        except Exception as e:
-            logger.warning(f"⚠️ Error processing IP {ip}: {e}")
-            return IPLocationData(ip=ip, processed_at=int(time.time()))
-
-
+# -----------------------------
+# Functions
+# -----------------------------
 def get_mongo_client() -> pymongo.MongoClient:
-    """Connect to MongoDB without authentication."""
     return pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 
 
 def get_unique_ips(limit: Optional[int] = None) -> List[str]:
-    """Get unique IP addresses from MongoDB collection."""
     client = get_mongo_client()
     collection = client[DB_NAME][SOURCE_COLLECTION]
-
     pipeline = [
         {"$match": {"ip": {"$exists": True, "$ne": None, "$type": "string"}}},
         {"$group": {"_id": "$ip"}},
@@ -112,25 +79,47 @@ def get_unique_ips(limit: Optional[int] = None) -> List[str]:
     return ips
 
 
-def process_ip_batch(ips: List[str], processor: IPLocationProcessor) -> List[IPLocationData]:
-    return [processor.get_location_data(ip) for ip in ips]
-
-
-def process_ips_parallel(ips: List[str], processor: IPLocationProcessor) -> List[IPLocationData]:
-    all_results = []
-    total = len(ips)
-    batches = [ips[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_ip_batch, b, processor)
-                   for b in batches]
-        for i, f in enumerate(as_completed(futures), start=1):
+def lookup_ip(ip: str) -> IPLocationData:
+    """Worker function for ProcessPoolExecutor"""
+    try:
+        db = IP2Location(IP2LOCATION_DB_PATH)
+        for attempt in range(RETRY_COUNT + 1):
             try:
-                all_results.extend(f.result())
-                if i % LOG_EVERY == 0 or i == len(futures):
-                    logger.info(f"⏳ Progress: {i}/{len(futures)} batches done")
+                start = time.time()
+                result = db.get_all(ip)
+                end = time.time()
+                return IPLocationData(
+                    ip=ip,
+                    country_code=result.country_short,
+                    country_name=result.country_long,
+                    region_name=result.region,
+                    city_name=result.city,
+                    latitude=float(result.latitude),
+                    longitude=float(result.longitude),
+                    processed_at=int(end),
+                    processing_time_ms=(end - start) * 1000
+                )
             except Exception as e:
-                logger.error(f"❌ Error in batch: {e}")
+                if attempt < RETRY_COUNT:
+                    continue
+                else:
+                    logger.warning(f"⚠️ Failed IP {ip} after retries: {e}")
+                    end = time.time()
+                    return IPLocationData(ip=ip, processed_at=int(end),
+                                          processing_time_ms=(end - start) * 1000)
+    except Exception as e:
+        logger.error(f"❌ Cannot load IP2Location DB in worker: {e}")
+        end = time.time()
+        return IPLocationData(ip=ip, processed_at=int(end),
+                              processing_time_ms=(end - start) * 1000)
+
+
+def process_ips_parallel(ips: List[str]) -> List[IPLocationData]:
+    all_results = []
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(lookup_ip, ip): ip for ip in ips}
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Processing IPs"):
+            all_results.append(f.result())
     logger.info(f"✅ Finished processing {len(all_results)} IPs")
     return all_results
 
@@ -141,7 +130,7 @@ def save_to_csv(data: List[IPLocationData]):
         return
 
     fieldnames = ['ip', 'country_code', 'country_name', 'region_name', 'city_name',
-                  'latitude', 'longitude', 'processed_at']
+                  'latitude', 'longitude', 'processed_at', 'processing_time_ms']
     with open(CSV_OUTPUT, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -168,20 +157,24 @@ def save_to_mongodb(data: List[IPLocationData]):
 
     client = get_mongo_client()
     col = client[DB_NAME][TARGET_COLLECTION]
-    docs = [d.__dict__ for d in data]
 
-    try:
-        result = col.insert_many(docs)
-        logger.info(
-            f"✅ Inserted {len(result.inserted_ids)} records into {TARGET_COLLECTION}")
-        col.create_index("ip")
-        logger.info("✅ Created index on 'ip'")
-    except Exception as e:
-        logger.error(f"❌ Error inserting to MongoDB: {e}")
+    for i in range(0, len(data), BATCH_SIZE):
+        batch = data[i:i + BATCH_SIZE]
+        docs = [d.__dict__ for d in batch]
+        try:
+            result = col.insert_many(docs)
+            logger.info(
+                f"✅ Inserted {len(result.inserted_ids)} records into {TARGET_COLLECTION}")
+        except Exception as e:
+            logger.error(f"❌ Error inserting batch to MongoDB: {e}")
+
+    col.create_index("ip")
+    logger.info("✅ Created index on 'ip'")
 
 
 def main():
-    import os
+    total_start = time.time()
+
     if not os.path.exists(IP2LOCATION_DB_PATH):
         logger.error(f"❌ Missing IP2Location DB file: {IP2LOCATION_DB_PATH}")
         sys.exit(1)
@@ -194,17 +187,19 @@ def main():
         logger.error(f"❌ Cannot connect to MongoDB: {e}")
         sys.exit(1)
 
-    processor = IPLocationProcessor()
     ips = get_unique_ips()
     if not ips:
         logger.warning("⚠️ No IPs found")
         sys.exit(1)
 
-    data = process_ips_parallel(ips, processor)
+    data = process_ips_parallel(ips)
     save_to_csv(data)
     save_to_jsonl(data)
     save_to_mongodb(data)
-    logger.info("🎉 Done!")
+
+    total_end = time.time()
+    logger.info(
+        f"🎉 Done! Total processing time: {total_end - total_start:.2f} seconds")
 
 
 if __name__ == "__main__":
