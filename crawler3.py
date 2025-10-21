@@ -6,29 +6,18 @@ import random
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
-import pymongo
 import os
 
 # -----------------------------
 # Configurations
 # -----------------------------
-MONGO_URI = "mongodb://127.0.0.1:27017/"
-DB_NAME = "glamira"
-SOURCE_COLLECTION = "summary"
-
-TARGET_EVENT_TYPES = [
-    "view_product_detail",
-    "select_product_option",
-    "select_product_option_quality",
-    "add_to_cart_action",
-    "product_detail_recommendation_visible",
-    "product_detail_recommendation_noticed",
-    "product_view_all_recommend_clicked",
-]
+# Input files from data_filter.py
+FILTERED_CSV = "merged_data.csv"
+FILTERED_JSONL = "product_urls.jsonl"
 
 DEFAULT_TIMEOUT_SECONDS = 5
 MAX_RETRIES = 2
@@ -58,19 +47,6 @@ except ImportError:
             yield item
 
 # -----------------------------
-# Global MongoClient
-# -----------------------------
-mongo_client = None
-
-
-def get_mongo_client() -> pymongo.MongoClient:
-    global mongo_client
-    if mongo_client is None:
-        mongo_client = pymongo.MongoClient(
-            MONGO_URI, serverSelectionTimeoutMS=10000)
-    return mongo_client
-
-# -----------------------------
 # Dataclasses
 # -----------------------------
 
@@ -94,69 +70,66 @@ def _safe_str(value: object) -> Optional[str]:
     return str(value).strip() or None
 
 
-def stream_product_ids(batch_size=1000):
-    """Stream product IDs theo batch để tránh tràn RAM"""
-    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
-
-    pipeline = [
-        {"$match": {
-            "collection": {"$in": TARGET_EVENT_TYPES},
-            "$or": [
-                {"product_id": {"$exists": True, "$ne": None, "$type": "string"}},
-                {"viewing_product_id": {"$exists": True, "$ne": None, "$type": "string"}}
-            ]
-        }},
-        {"$project": {
-            "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}}
-    ]
-
-    cursor = col.aggregate(pipeline, allowDiskUse=True)
-
-    batch = []
-    for doc in cursor:
-        batch.append(doc["pid"])
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-def count_total_products():
-    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
-    pipeline = [
-        {"$match": {
-            "collection": {"$in": TARGET_EVENT_TYPES},
-            "$or": [
-                {"product_id": {"$exists": True, "$ne": None, "$type": "string"}},
-                {"viewing_product_id": {"$exists": True, "$ne": None, "$type": "string"}}
-            ]
-        }},
-        {"$project": {
-            "pid": {"$ifNull": ["$product_id", "$viewing_product_id"]}}},
-        {"$group": {"_id": "$pid"}},
-        {"$count": "total"}
-    ]
-    result = list(col.aggregate(pipeline))
-    return result[0]["total"] if result else 0
+def load_filtered_data() -> Dict[str, List[Dict]]:
+    """Load filtered data from data_filter.py output files"""
+    product_urls = {}
+    
+    # Load from JSONL file (more efficient for large datasets)
+    if os.path.exists(FILTERED_JSONL):
+        logger.info(f"📂 Loading data from {FILTERED_JSONL}")
+        with open(FILTERED_JSONL, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    product_id = record['product_id']
+                    if product_id not in product_urls:
+                        product_urls[product_id] = []
+                    product_urls[product_id].append(record)
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"Skipping invalid line: {e}")
+                    continue
+    else:
+        # Fallback to CSV if JSONL doesn't exist
+        logger.info(f"📂 Loading data from {FILTERED_CSV}")
+        with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                product_id = row['product_id']
+                if product_id not in product_urls:
+                    product_urls[product_id] = []
+                product_urls[product_id].append(row)
+    
+    logger.info(f"✅ Loaded {len(product_urls)} distinct product IDs")
+    return product_urls
 
 
-def get_urls_for_product(product_id: str, limit: int = URLS_PER_PRODUCT) -> List[UrlRecord]:
-    col = get_mongo_client()[DB_NAME][SOURCE_COLLECTION]
-    query = {
-        "$or": [{"product_id": product_id}, {"viewing_product_id": product_id}],
-        "collection": {"$in": TARGET_EVENT_TYPES},
-    }
+def stream_product_ids_from_filtered(product_urls: Dict[str, List[Dict]], batch_size=1000):
+    """Stream product IDs from filtered data in batches"""
+    product_ids = list(product_urls.keys())
+    
+    for i in range(0, len(product_ids), batch_size):
+        yield product_ids[i:i + batch_size]
 
-    urls = col.distinct(
-        "current_url",
-        query
-    )[:limit]
 
+def count_total_products_from_filtered(product_urls: Dict[str, List[Dict]]) -> int:
+    """Count total distinct product IDs from filtered data"""
+    return len(product_urls)
+
+
+def get_urls_for_product_from_filtered(product_id: str, product_urls: Dict[str, List[Dict]], limit: int = URLS_PER_PRODUCT) -> List[UrlRecord]:
+    """Get URLs for a product from filtered data"""
+    if product_id not in product_urls:
+        return []
+    
     records = []
-    for url in urls:
-        records.append(
-            UrlRecord(product_id, _safe_str(url), SOURCE_COLLECTION))
+    urls = product_urls[product_id][:limit]  # Limit URLs per product
+    
+    for url_data in urls:
+        url = url_data.get('url')
+        source_collection = url_data.get('source_collection', 'unknown')
+        if url:
+            records.append(UrlRecord(product_id, _safe_str(url), source_collection))
+    
     return records
 
 
@@ -239,10 +212,15 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
 
 
 def deduplicate_by_product_id(candidates: List[Dict]) -> List[Dict]:
+    """Deduplicate by product_id, keeping only one active product name per product_id"""
     deduped = {}
     for row in candidates:
         pid = row["product_id"]
-        if pid not in deduped or (deduped[pid].get("product_name") is None and row.get("product_name")):
+        # Keep the first record with a valid product_name, or the first record if no name found
+        if pid not in deduped:
+            deduped[pid] = row
+        elif (deduped[pid].get("product_name") is None and row.get("product_name")):
+            # Replace if current has no name but new one has name
             deduped[pid] = row
     return list(deduped.values())
 
@@ -268,8 +246,10 @@ def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
 
 
 def main():
-    total_expected = count_total_products()
-    logger.info(f"📊 Total product IDs expected: {total_expected}")
+    # Load filtered data from data_filter.py output
+    product_urls = load_filtered_data()
+    total_expected = count_total_products_from_filtered(product_urls)
+    logger.info(f"📊 Total distinct product IDs from filtered data: {total_expected}")
 
     # Load existing processed products
     existing_pids = set()
@@ -282,7 +262,7 @@ def main():
     total_processed = 0
     total_with_name = 0
 
-    for batch in stream_product_ids(batch_size=BATCH_SIZE):
+    for batch in stream_product_ids_from_filtered(product_urls, batch_size=BATCH_SIZE):
         # Skip already processed
         batch = [pid for pid in batch if pid not in existing_pids]
         if not batch:
@@ -291,8 +271,8 @@ def main():
         logger.info(f"🔄 Processing batch with {len(batch)} product IDs...")
         url_records = []
         for pid in batch:
-            url_records.extend(get_urls_for_product(
-                pid, limit=URLS_PER_PRODUCT))
+            url_records.extend(get_urls_for_product_from_filtered(
+                pid, product_urls, limit=URLS_PER_PRODUCT))
 
         candidates = crawl_product_names_parallel(url_records)
         deduped = deduplicate_by_product_id(candidates)

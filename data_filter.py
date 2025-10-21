@@ -10,7 +10,7 @@ import json
 import time
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from pymongo import MongoClient
 from urllib.parse import urlparse
 
@@ -63,6 +63,7 @@ def process_in_batches():
     collection = db[SUMMARY_COLLECTION]
 
     grouped = {}
+    seen_product_ids: Set[str] = set()
     total_records = 0
 
     # Ghi file CSV & JSONL ngay từ đầu (append)
@@ -73,28 +74,35 @@ def process_in_batches():
     jsonl_file = open(URLS_JSONL, 'w', encoding='utf-8')
 
     # Các loại sub-collection cần lấy
-    target_collections = [
+    # 6 collections đầu: lấy product_id/viewing_product_id + current_url
+    main_collections = [
         "view_product_detail",
-        "select_product_option",
+        "select_product_option", 
         "select_product_option_quality",
         "add_to_cart_action",
         "product_detail_recommendation_visible",
-        "product_detail_recommendation_noticed",
-        "product_view_all_recommend_clicked"
+        "product_detail_recommendation_noticed"
     ]
+    
+    # Collection đặc biệt: lấy viewing_product_id + referrer_url
+    special_collection = "product_view_all_recommend_clicked"
 
-    for sub_collection in target_collections:
+    # Xử lý 6 collections chính
+    for sub_collection in main_collections:
         logger.info(f"🔍 Processing '{sub_collection}' ...")
 
         query = {
             "collection": sub_collection,
-            "$or": [
-                {"product_id": {"$exists": True, "$ne": None}},
-                {"viewing_product_id": {"$exists": True, "$ne": None}}
-            ],
-            "$or": [
-                {"current_url": {"$exists": True, "$ne": None}},
-                {"referrer_url": {"$exists": True, "$ne": None}}
+            "$and": [
+                {
+                    "$or": [
+                        {"product_id": {"$exists": True, "$ne": None}},
+                        {"viewing_product_id": {"$exists": True, "$ne": None}}
+                    ]
+                },
+                {
+                    "current_url": {"$exists": True, "$ne": None}
+                }
             ]
         }
 
@@ -103,7 +111,7 @@ def process_in_batches():
         batch = []
         for doc in cursor:
             pid = str(doc.get("product_id") or doc.get("viewing_product_id"))
-            url = doc.get("current_url") or doc.get("referrer_url")
+            url = doc.get("current_url")
             if not pid or not url:
                 continue
 
@@ -119,15 +127,61 @@ def process_in_batches():
 
             # Khi đủ batch, xử lý
             if len(batch) >= BATCH_SIZE:
-                save_batch(batch, csv_writer, jsonl_file, grouped)
+                save_batch(batch, csv_writer, jsonl_file, grouped, seen_product_ids)
                 batch.clear()
 
         # Lưu nốt phần cuối
         if batch:
-            save_batch(batch, csv_writer, jsonl_file, grouped)
+            save_batch(batch, csv_writer, jsonl_file, grouped, seen_product_ids)
             batch.clear()
 
         logger.info(f"✅ Finished '{sub_collection}'")
+
+    # Xử lý collection đặc biệt: product_view_all_recommend_clicked
+    logger.info(f"🔍 Processing '{special_collection}' ...")
+    
+    special_query = {
+        "collection": special_collection,
+        "$and": [
+            {
+                "viewing_product_id": {"$exists": True, "$ne": None}
+            },
+            {
+                "referrer_url": {"$exists": True, "$ne": None}
+            }
+        ]
+    }
+    
+    cursor = collection.find(special_query, batch_size=BATCH_SIZE)
+    
+    batch = []
+    for doc in cursor:
+        pid = str(doc.get("viewing_product_id"))
+        url = doc.get("referrer_url")
+        if not pid or not url:
+            continue
+            
+        record = ProductUrlRecord(
+            product_id=pid,
+            url=url,
+            source_collection=special_collection,
+            timestamp=doc.get("time_stamp")
+        )
+
+        batch.append(record)
+        total_records += 1
+
+        # Khi đủ batch, xử lý
+        if len(batch) >= BATCH_SIZE:
+            save_batch(batch, csv_writer, jsonl_file, grouped, seen_product_ids)
+            batch.clear()
+
+    # Lưu nốt phần cuối cho collection đặc biệt
+    if batch:
+        save_batch(batch, csv_writer, jsonl_file, grouped, seen_product_ids)
+        batch.clear()
+
+    logger.info(f"✅ Finished '{special_collection}'")
 
     csv_file.close()
     jsonl_file.close()
@@ -138,9 +192,14 @@ def process_in_batches():
     logger.info(f"🎉 Done. Processed {total_records} records from summary collection.")
 
 
-def save_batch(batch: List[ProductUrlRecord], csv_writer, jsonl_file, grouped: Dict):
+def save_batch(batch: List[ProductUrlRecord], csv_writer, jsonl_file, grouped: Dict, seen_product_ids: Set[str]):
     """Save batch to CSV, JSONL, and update grouped data in memory."""
     for r in batch:
+        # Distinct by product_id: skip if we've already processed this product_id
+        if r.product_id in seen_product_ids:
+            continue
+
+        seen_product_ids.add(r.product_id)
         csv_writer.writerow(vars(r))
         jsonl_file.write(json.dumps(vars(r), ensure_ascii=False) + "\n")
 
