@@ -149,20 +149,49 @@ def http_get(url: str) -> Optional[str]:
 
 def extract_product_name(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
-    for sel in ["h1.page-title span.base", "h1.product-title", "h1.product-name", "h1"]:
+    
+    # Thêm nhiều selector hơn để tìm product name
+    selectors = [
+        "h1.page-title span.base",
+        "h1.product-title", 
+        "h1.product-name",
+        "h1",
+        ".product-title",
+        ".product-name", 
+        ".page-title",
+        "title",
+        "[data-testid='product-title']",
+        ".product-info h1",
+        ".product-details h1",
+        ".product-header h1"
+    ]
+    
+    for sel in selectors:
         el = soup.select_one(sel)
         if el:
-            return el.get_text(strip=True)
+            text = el.get_text(strip=True)
+            if text and len(text) > 3:  # Đảm bảo có nội dung thực sự
+                return text
     return None
 
 
 def process_single_url(record: UrlRecord) -> Dict:
     html = http_get(record.url)
+    product_name = None
+    status = "failed"
+    
+    if html:
+        product_name = extract_product_name(html)
+        status = "success" if product_name else "no_name_found"
+    else:
+        status = "no_html"
+    
     return {
         "product_id": record.product_id,
         "url": record.url,
         "source_collection": record.source_collection,
-        "product_name": extract_product_name(html) if html else None,
+        "product_name": product_name,
+        "status": status,
         "fetched_at": int(time.time()),
     }
 
@@ -235,7 +264,7 @@ def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
     file_exists = os.path.exists(path)
     with open(path, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-                                "product_id", "product_name", "url", "source_collection", "fetched_at"])
+                                "product_id", "product_name", "url", "source_collection", "status", "fetched_at"])
         if not file_exists:
             writer.writeheader()
         writer.writerows(candidates)
@@ -282,16 +311,24 @@ def main():
 
         processed_batch = len(deduped)
         with_name_batch = sum(1 for row in deduped if row.get("product_name"))
+        
+        # Thống kê chi tiết
+        status_counts = {}
+        for row in deduped:
+            status = row.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
 
         total_processed += processed_batch
         total_with_name += with_name_batch
 
         percent = (total_processed / total_expected) * \
             100 if total_expected else 0
+        
         logger.info(
             f"✅ Finished batch. Total processed: {total_processed}/{total_expected} "
             f"({percent:.2f}% done). With product_name: {total_with_name}"
         )
+        logger.info(f"📊 Status breakdown: {status_counts}")
 
     logger.info(
         f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
