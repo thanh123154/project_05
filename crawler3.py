@@ -240,18 +240,7 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     return results
 
 
-def deduplicate_by_product_id(candidates: List[Dict]) -> List[Dict]:
-    """Deduplicate by product_id, keeping only one active product name per product_id"""
-    deduped = {}
-    for row in candidates:
-        pid = row["product_id"]
-        # Keep the first record with a valid product_name, or the first record if no name found
-        if pid not in deduped:
-            deduped[pid] = row
-        elif (deduped[pid].get("product_name") is None and row.get("product_name")):
-            # Replace if current has no name but new one has name
-            deduped[pid] = row
-    return list(deduped.values())
+# Removed deduplicate_by_product_id function since data_filter.py already ensures unique product_ids
 
 
 def append_candidates_jsonl(candidates: List[Dict], path: str = CANDIDATES_JSONL) -> None:
@@ -304,17 +293,16 @@ def main():
                 pid, product_urls, limit=URLS_PER_PRODUCT))
 
         candidates = crawl_product_names_parallel(url_records)
-        deduped = deduplicate_by_product_id(candidates)
 
-        append_candidates_jsonl(deduped)
-        append_final_csv(deduped)
+        append_candidates_jsonl(candidates)
+        append_final_csv(candidates)
 
-        processed_batch = len(deduped)
-        with_name_batch = sum(1 for row in deduped if row.get("product_name"))
+        processed_batch = len(candidates)
+        with_name_batch = sum(1 for row in candidates if row.get("product_name"))
         
         # Thống kê chi tiết
         status_counts = {}
-        for row in deduped:
+        for row in candidates:
             status = row.get("status", "unknown")
             status_counts[status] = status_counts.get(status, 0) + 1
 
