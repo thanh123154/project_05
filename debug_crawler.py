@@ -50,6 +50,7 @@ DOMAIN_LANG = {
     ".at": "de-AT,de;q=0.9,en;q=0.8",
     ".za": "en-ZA,en;q=0.9",
     ".com.au": "en-AU,en;q=0.9",
+    ".uk": "en-GB,en;q=0.9",
 }
 
 
@@ -214,8 +215,48 @@ def test_url(url: str):
             "name_found": False,
         }
 
+def analyze_domains_in_data():
+    """Phân tích các domain có trong data"""
+    print("🔍 Analyzing domains in data...")
+    
+    domain_counts = defaultdict(int)
+    total_urls = 0
+    
+    try:
+        with open("product_urls.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    url = data.get('url', '')
+                    if url:
+                        domain = urllib.parse.urlsplit(url).netloc
+                        domain_counts[domain] += 1
+                        total_urls += 1
+                except:
+                    continue
+    except FileNotFoundError:
+        print("❌ File product_urls.jsonl not found. Run data_filter.py first.")
+        return
+    
+    print(f"📊 Total URLs in data: {total_urls}")
+    print(f"📊 Unique domains: {len(domain_counts)}")
+    print("\nDomain breakdown:")
+    
+    # Sort by count descending
+    sorted_domains = sorted(domain_counts.items(), key=lambda x: -x[1])
+    for domain, count in sorted_domains:
+        percentage = (count / total_urls * 100) if total_urls > 0 else 0
+        print(f"  - {domain}: {count} URLs ({percentage:.1f}%)")
+    
+    return domain_counts
+
+
 def main():
     print("🐛 Debug Crawler - Testing sample URLs")
+    
+    # Phân tích domains trước
+    domain_counts = analyze_domains_in_data()
+    print("\n" + "="*50 + "\n")
     
     # Đọc một vài URLs từ file để test
     try:
