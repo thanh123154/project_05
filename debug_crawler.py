@@ -10,6 +10,7 @@ import random
 import time
 import urllib.parse
 from collections import defaultdict
+import re
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
@@ -39,11 +40,31 @@ def sanitize_url(url: str) -> str:
         return url
 
 
-def build_headers(referrer: str | None = None) -> dict:
+DOMAIN_LANG = {
+    ".fr": "fr-FR,fr;q=0.9,en;q=0.8",
+    ".be": "fr-BE,fr;q=0.9,nl;q=0.8,en;q=0.7",
+    ".pl": "pl-PL,pl;q=0.9,en;q=0.8",
+    ".cz": "cs-CZ,cs;q=0.9,en;q=0.8",
+    ".ch": "de-CH,de;q=0.9,fr-CH,fr;q=0.8,it-CH,it;q=0.7,en;q=0.6",
+    ".pt": "pt-PT,pt;q=0.9,en;q=0.8",
+    ".at": "de-AT,de;q=0.9,en;q=0.8",
+    ".za": "en-ZA,en;q=0.9",
+    ".com.au": "en-AU,en;q=0.9",
+}
+
+
+def guess_accept_language(domain: str) -> str:
+    for tld, lang in DOMAIN_LANG.items():
+        if domain.endswith(tld):
+            return lang
+    return "en-US,en;q=0.9"
+
+
+def build_headers(referrer: str | None = None, domain: str | None = None) -> dict:
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": guess_accept_language(domain or ""),
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
@@ -51,6 +72,9 @@ def build_headers(referrer: str | None = None) -> dict:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
+        "sec-ch-ua": '"Chromium";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
     if referrer:
         headers["Referer"] = referrer
@@ -60,7 +84,8 @@ def build_headers(referrer: str | None = None) -> dict:
 def get_with_retries(url: str, timeout: int = 10, max_retries: int = 3):
     url = sanitize_url(url)
     sess = requests.Session()
-    headers = build_headers()
+    domain = urllib.parse.urlsplit(url).netloc
+    headers = build_headers(domain=domain)
     scraper = None
     try:
         import cloudscraper  # type: ignore
@@ -72,13 +97,26 @@ def get_with_retries(url: str, timeout: int = 10, max_retries: int = 3):
     last_resp = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = sess.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            # Warm-up: visit homepage to receive cookies and geolocation
+            homepage = f"https://{domain}/"
+            try:
+                sess.get(homepage, headers=headers, timeout=timeout, allow_redirects=True)
+                # small randomized delay
+                time.sleep(0.4 + random.random() * 0.6)
+            except Exception:
+                pass
+
+            # Use homepage as referer
+            headers_with_ref = dict(headers)
+            headers_with_ref["Referer"] = homepage
+
+            resp = sess.get(url, headers=headers_with_ref, timeout=timeout, allow_redirects=True)
             last_resp = resp
             if resp.status_code == 200:
                 return resp, headers, url, False
             if resp.status_code in (403, 429, 503) and scraper is not None:
                 try:
-                    scr_resp = scraper.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                    scr_resp = scraper.get(url, headers=headers_with_ref, timeout=timeout, allow_redirects=True)
                     if scr_resp.status_code == 200:
                         return scr_resp, headers, url, True
                 except Exception:
