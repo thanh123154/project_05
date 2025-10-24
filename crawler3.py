@@ -4,9 +4,11 @@ import json
 import time
 import random
 import logging
+import gc
+import psutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Generator
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,9 +30,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
-MAX_WORKERS = 50
-BATCH_SIZE = 1000   # số lượng product xử lý 1 lần
-URLS_PER_PRODUCT = 10
+MAX_WORKERS = 20  # Giảm số workers để tránh quá tải
+BATCH_SIZE = 500   # Giảm batch size để tiết kiệm RAM
+URLS_PER_PRODUCT = 5  # Giảm số URL per product
+MEMORY_LIMIT_MB = 1024  # Giới hạn RAM usage
 
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
@@ -70,67 +73,122 @@ def _safe_str(value: object) -> Optional[str]:
     return str(value).strip() or None
 
 
-def load_filtered_data() -> Dict[str, List[Dict]]:
-    """Load filtered data from data_filter.py output files"""
-    product_urls = {}
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB"""
+    process = psutil.Process()
+    return process.memory_info().rss / 1024 / 1024
+
+
+def check_memory_limit() -> bool:
+    """Check if memory usage exceeds limit"""
+    current_mb = get_memory_usage_mb()
+    if current_mb > MEMORY_LIMIT_MB:
+        logger.warning(f"⚠️ Memory usage {current_mb:.1f}MB exceeds limit {MEMORY_LIMIT_MB}MB")
+        return True
+    return False
+
+
+def force_garbage_collection():
+    """Force garbage collection to free memory"""
+    gc.collect()
+    logger.info(f"🧹 Garbage collection completed. Memory: {get_memory_usage_mb():.1f}MB")
+
+
+def stream_filtered_data_batches(batch_size: int = BATCH_SIZE) -> Generator[List[Dict], None, None]:
+    """Stream filtered data in batches to avoid loading everything into memory"""
+    logger.info(f"📂 Streaming data from {FILTERED_JSONL} in batches of {batch_size}")
     
-    # Load from JSONL file (more efficient for large datasets)
+    current_batch = []
+    product_ids_seen = set()
+    
     if os.path.exists(FILTERED_JSONL):
-        logger.info(f"📂 Loading data from {FILTERED_JSONL}")
+        with open(FILTERED_JSONL, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    record = json.loads(line.strip())
+                    product_id = record['product_id']
+                    
+                    # Chỉ thêm nếu chưa xử lý product_id này
+                    if product_id not in product_ids_seen:
+                        current_batch.append(record)
+                        product_ids_seen.add(product_id)
+                        
+                        # Yield batch khi đủ size
+                        if len(current_batch) >= batch_size:
+                            yield current_batch
+                            current_batch = []
+                            
+                            # Check memory và force GC nếu cần
+                            if check_memory_limit():
+                                force_garbage_collection()
+                                
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"Skipping invalid line {line_num}: {e}")
+                    continue
+    else:
+        # Fallback to CSV streaming
+        logger.info(f"📂 Streaming data from {FILTERED_CSV} in batches of {batch_size}")
+        with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row_num, row in enumerate(reader, 1):
+                product_id = row['product_id']
+                
+                if product_id not in product_ids_seen:
+                    current_batch.append(row)
+                    product_ids_seen.add(product_id)
+                    
+                    if len(current_batch) >= batch_size:
+                        yield current_batch
+                        current_batch = []
+                        
+                        if check_memory_limit():
+                            force_garbage_collection()
+    
+    # Yield remaining batch
+    if current_batch:
+        yield current_batch
+    
+    logger.info(f"✅ Finished streaming. Total unique product IDs: {len(product_ids_seen)}")
+
+
+def count_total_products_streaming() -> int:
+    """Count total unique product IDs without loading all data into memory"""
+    product_ids = set()
+    
+    if os.path.exists(FILTERED_JSONL):
         with open(FILTERED_JSONL, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     record = json.loads(line.strip())
-                    product_id = record['product_id']
-                    if product_id not in product_urls:
-                        product_urls[product_id] = []
-                    product_urls[product_id].append(record)
-                except (json.JSONDecodeError, KeyError) as e:
-                    logger.warning(f"Skipping invalid line: {e}")
+                    product_ids.add(record['product_id'])
+                except (json.JSONDecodeError, KeyError):
                     continue
     else:
-        # Fallback to CSV if JSONL doesn't exist
-        logger.info(f"📂 Loading data from {FILTERED_CSV}")
         with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                product_id = row['product_id']
-                if product_id not in product_urls:
-                    product_urls[product_id] = []
-                product_urls[product_id].append(row)
+                product_ids.add(row['product_id'])
     
-    logger.info(f"✅ Loaded {len(product_urls)} distinct product IDs")
-    return product_urls
+    return len(product_ids)
 
 
-def stream_product_ids_from_filtered(product_urls: Dict[str, List[Dict]], batch_size=1000):
-    """Stream product IDs from filtered data in batches"""
-    product_ids = list(product_urls.keys())
+def process_batch_data(batch_data: List[Dict]) -> List[UrlRecord]:
+    """Process a batch of data and convert to UrlRecord list"""
+    url_records = []
     
-    for i in range(0, len(product_ids), batch_size):
-        yield product_ids[i:i + batch_size]
-
-
-def count_total_products_from_filtered(product_urls: Dict[str, List[Dict]]) -> int:
-    """Count total distinct product IDs from filtered data"""
-    return len(product_urls)
-
-
-def get_urls_for_product_from_filtered(product_id: str, product_urls: Dict[str, List[Dict]], limit: int = URLS_PER_PRODUCT) -> List[UrlRecord]:
-    """Get URLs for a product from filtered data"""
-    if product_id not in product_urls:
-        return []
+    for record in batch_data:
+        product_id = record.get('product_id')
+        url = record.get('url')
+        source_collection = record.get('source_collection', 'unknown')
+        
+        if product_id and url:
+            url_records.append(UrlRecord(
+                product_id=product_id,
+                url=_safe_str(url),
+                source_collection=source_collection
+            ))
     
-    records = []
-    urls = product_urls[product_id][:limit]  # Limit URLs per product
-    
-    for url_data in urls:
-        url = url_data.get('url')
-        source_collection = url_data.get('source_collection', 'unknown')
-        if url:
-            records.append(UrlRecord(product_id, _safe_str(url), source_collection))
-    
-    return records
+    return url_records
 
 
 def http_get(url: str) -> Optional[str]:
@@ -200,6 +258,10 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     results = []
     total = len(records)
     completed = 0
+    
+    # Log memory usage before starting
+    initial_memory = get_memory_usage_mb()
+    logger.info(f"🧠 Starting crawl with {total} records. Initial memory: {initial_memory:.1f}MB")
 
     try:
         progress = tqdm(total=total, desc="Crawling products")
@@ -219,17 +281,22 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
                 logger.warning(f"Error: {e}")
             finally:
                 completed += 1
+                
+                # Memory monitoring
+                if completed % log_every == 0 or completed == total:
+                    current_memory = get_memory_usage_mb()
+                    percent = (completed * 100.0 / total) if total else 100.0
+                    logger.info(f"⏳ Progress: {completed}/{total} ({percent:.1f}%) - Memory: {current_memory:.1f}MB")
+                    
+                    # Force GC if memory usage is high
+                    if check_memory_limit():
+                        force_garbage_collection()
+                
                 if has_progress_update and progress is not None:
                     try:
                         progress.update(1)
                     except Exception:
                         pass
-                else:
-                    if completed % log_every == 0 or completed == total:
-                        percent = (completed * 100.0 /
-                                   total) if total else 100.0
-                        logger.info(
-                            f"⏳ Progress: {completed}/{total} ({percent:.1f}%)")
 
     if progress is not None and hasattr(progress, "close"):
         try:
@@ -237,6 +304,10 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
         except Exception:
             pass
 
+    # Final memory check
+    final_memory = get_memory_usage_mb()
+    logger.info(f"🧠 Finished crawl. Memory: {final_memory:.1f}MB (Δ: {final_memory - initial_memory:+.1f}MB)")
+    
     return results
 
 
@@ -264,10 +335,10 @@ def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
 
 
 def main():
-    # Load filtered data from data_filter.py output
-    product_urls = load_filtered_data()
-    total_expected = count_total_products_from_filtered(product_urls)
+    # Count total products without loading all data
+    total_expected = count_total_products_streaming()
     logger.info(f"📊 Total distinct product IDs from filtered data: {total_expected}")
+    logger.info(f"🧠 Initial memory usage: {get_memory_usage_mb():.1f}MB")
 
     # Load existing processed products
     existing_pids = set()
@@ -276,27 +347,42 @@ def main():
             reader = csv.DictReader(f)
             for row in reader:
                 existing_pids.add(row["product_id"])
+        logger.info(f"📋 Found {len(existing_pids)} already processed products")
 
     total_processed = 0
     total_with_name = 0
+    batch_count = 0
 
-    for batch in stream_product_ids_from_filtered(product_urls, batch_size=BATCH_SIZE):
-        # Skip already processed
-        batch = [pid for pid in batch if pid not in existing_pids]
-        if not batch:
+    # Process data in streaming batches
+    for batch_data in stream_filtered_data_batches(batch_size=BATCH_SIZE):
+        batch_count += 1
+        
+        # Filter out already processed products
+        batch_data = [record for record in batch_data 
+                     if record.get('product_id') not in existing_pids]
+        
+        if not batch_data:
+            logger.info(f"⏭️ Batch {batch_count}: All products already processed, skipping")
             continue
 
-        logger.info(f"🔄 Processing batch with {len(batch)} product IDs...")
-        url_records = []
-        for pid in batch:
-            url_records.extend(get_urls_for_product_from_filtered(
-                pid, product_urls, limit=URLS_PER_PRODUCT))
+        logger.info(f"🔄 Processing batch {batch_count} with {len(batch_data)} products...")
+        logger.info(f"🧠 Memory before batch: {get_memory_usage_mb():.1f}MB")
+        
+        # Convert batch data to URL records
+        url_records = process_batch_data(batch_data)
+        
+        if not url_records:
+            logger.warning(f"⚠️ Batch {batch_count}: No valid URL records found")
+            continue
 
+        # Process URLs in parallel
         candidates = crawl_product_names_parallel(url_records)
 
+        # Save results
         append_candidates_jsonl(candidates)
         append_final_csv(candidates)
 
+        # Update statistics
         processed_batch = len(candidates)
         with_name_batch = sum(1 for row in candidates if row.get("product_name"))
         
@@ -309,17 +395,23 @@ def main():
         total_processed += processed_batch
         total_with_name += with_name_batch
 
-        percent = (total_processed / total_expected) * \
-            100 if total_expected else 0
+        percent = (total_processed / total_expected) * 100 if total_expected else 0
         
-        logger.info(
-            f"✅ Finished batch. Total processed: {total_processed}/{total_expected} "
-            f"({percent:.2f}% done). With product_name: {total_with_name}"
-        )
+        logger.info(f"✅ Finished batch {batch_count}. Processed: {processed_batch}, With names: {with_name_batch}")
+        logger.info(f"📊 Total progress: {total_processed}/{total_expected} ({percent:.2f}% done)")
         logger.info(f"📊 Status breakdown: {status_counts}")
+        logger.info(f"🧠 Memory after batch: {get_memory_usage_mb():.1f}MB")
+        
+        # Force garbage collection after each batch
+        force_garbage_collection()
+        
+        # Check if we should pause due to memory
+        if check_memory_limit():
+            logger.warning("⚠️ Memory limit reached, forcing cleanup...")
+            time.sleep(2)  # Brief pause to let system recover
 
-    logger.info(
-        f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
+    logger.info(f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
+    logger.info(f"🧠 Final memory usage: {get_memory_usage_mb():.1f}MB")
 
 
 if __name__ == "__main__":
