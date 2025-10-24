@@ -42,7 +42,7 @@ CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
 
 # Có thể thay đổi level để debug
-DEBUG_MODE = False  # Set True để enable debug logging
+DEBUG_MODE = True  # Set True để enable debug logging
 
 log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
 logging.basicConfig(level=log_level,
