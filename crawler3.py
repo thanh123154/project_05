@@ -35,6 +35,9 @@ BATCH_SIZE = 500   # Giảm batch size để tiết kiệm RAM
 URLS_PER_PRODUCT = 5  # Giảm số URL per product
 MEMORY_LIMIT_MB = 1024  # Giới hạn RAM usage
 
+# Tùy chọn để force process (bỏ qua existing products)
+FORCE_PROCESS = False  # Set True để xử lý lại tất cả products
+
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
 
@@ -340,14 +343,16 @@ def main():
     logger.info(f"📊 Total distinct product IDs from filtered data: {total_expected}")
     logger.info(f"🧠 Initial memory usage: {get_memory_usage_mb():.1f}MB")
 
-    # Load existing processed products
+    # Load existing processed products (skip if FORCE_PROCESS)
     existing_pids = set()
-    if os.path.exists(FINAL_CSV):
+    if not FORCE_PROCESS and os.path.exists(FINAL_CSV):
         with open(FINAL_CSV, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 existing_pids.add(row["product_id"])
         logger.info(f"📋 Found {len(existing_pids)} already processed products")
+    elif FORCE_PROCESS:
+        logger.info("🔄 FORCE_PROCESS enabled - will process all products")
 
     total_processed = 0
     total_with_name = 0
@@ -358,8 +363,12 @@ def main():
         batch_count += 1
         
         # Filter out already processed products
+        original_batch_size = len(batch_data)
         batch_data = [record for record in batch_data 
                      if record.get('product_id') not in existing_pids]
+        filtered_batch_size = len(batch_data)
+        
+        logger.info(f"📊 Batch {batch_count}: {original_batch_size} -> {filtered_batch_size} products (filtered: {original_batch_size - filtered_batch_size})")
         
         if not batch_data:
             logger.info(f"⏭️ Batch {batch_count}: All products already processed, skipping")
