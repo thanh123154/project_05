@@ -36,7 +36,7 @@ URLS_PER_PRODUCT = 5  # Giảm số URL per product
 MEMORY_LIMIT_MB = 1024  # Giới hạn RAM usage
 
 # Tùy chọn để force process (bỏ qua existing products)
-FORCE_PROCESS = False  # Set True để xử lý lại tất cả products
+FORCE_PROCESS = True  # Set True để xử lý lại tất cả products
 
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
