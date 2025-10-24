@@ -21,9 +21,9 @@ import os
 FILTERED_CSV = "merged_data.csv"
 FILTERED_JSONL = "product_urls.jsonl"
 
-DEFAULT_TIMEOUT_SECONDS = 5
-MAX_RETRIES = 2
-RETRY_BACKOFF_BASE_SECONDS = 1
+DEFAULT_TIMEOUT_SECONDS = 10  # Tăng timeout
+MAX_RETRIES = 3  # Tăng số lần retry
+RETRY_BACKOFF_BASE_SECONDS = 2  # Tăng thời gian chờ giữa các retry
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -41,7 +41,11 @@ FORCE_PROCESS = True  # Set True để xử lý lại tất cả products
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
 
-logging.basicConfig(level=logging.INFO,
+# Có thể thay đổi level để debug
+DEBUG_MODE = False  # Set True để enable debug logging
+
+log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+logging.basicConfig(level=log_level,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -195,57 +199,137 @@ def process_batch_data(batch_data: List[Dict]) -> List[UrlRecord]:
 
 
 def http_get(url: str) -> Optional[str]:
+    """Get HTML content from URL with detailed error handling"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS)},
-                                timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            
+            resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, 
+                              allow_redirects=True, verify=False)
+            
             if resp.status_code == 200:
                 return resp.text
-        except requests.RequestException:
-            pass
+            elif resp.status_code == 404:
+                logger.debug(f"404 Not Found: {url}")
+                return None
+            elif resp.status_code == 403:
+                logger.debug(f"403 Forbidden: {url}")
+                return None
+            else:
+                logger.debug(f"HTTP {resp.status_code}: {url}")
+                
+        except requests.exceptions.Timeout:
+            logger.debug(f"Timeout (attempt {attempt}): {url}")
+        except requests.exceptions.ConnectionError:
+            logger.debug(f"Connection error (attempt {attempt}): {url}")
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Request error (attempt {attempt}): {url} - {e}")
+        except Exception as e:
+            logger.debug(f"Unexpected error (attempt {attempt}): {url} - {e}")
+            
         if attempt < MAX_RETRIES:
-            time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
+            sleep_time = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            time.sleep(sleep_time)
+    
     return None
 
 
 def extract_product_name(html: str) -> Optional[str]:
+    """Extract product name from HTML with improved selectors"""
     soup = BeautifulSoup(html, "html.parser")
+    
+    # Loại bỏ script và style tags
+    for script in soup(["script", "style"]):
+        script.decompose()
     
     # Thêm nhiều selector hơn để tìm product name
     selectors = [
+        # Magento specific
         "h1.page-title span.base",
+        "h1.page-title",
+        ".page-title",
+        
+        # Generic product selectors
         "h1.product-title", 
         "h1.product-name",
-        "h1",
         ".product-title",
         ".product-name", 
-        ".page-title",
-        "title",
-        "[data-testid='product-title']",
         ".product-info h1",
         ".product-details h1",
-        ".product-header h1"
+        ".product-header h1",
+        
+        # Data attributes
+        "[data-testid='product-title']",
+        "[data-testid='product-name']",
+        "[data-role='product-name']",
+        
+        # Meta tags
+        "meta[property='og:title']",
+        "meta[name='title']",
+        
+        # Generic h1
+        "h1",
+        
+        # Title tag
+        "title"
     ]
     
     for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            text = el.get_text(strip=True)
-            if text and len(text) > 3:  # Đảm bảo có nội dung thực sự
-                return text
+        try:
+            if sel.startswith("meta"):
+                el = soup.select_one(sel)
+                if el:
+                    text = el.get('content', '').strip()
+            else:
+                el = soup.select_one(sel)
+                if el:
+                    text = el.get_text(strip=True)
+            
+            if text and len(text) > 3 and len(text) < 200:  # Reasonable length
+                # Clean up the text
+                text = text.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ')
+                text = ' '.join(text.split())  # Remove extra whitespace
+                
+                # Skip common non-product text
+                skip_phrases = [
+                    "404", "not found", "error", "page not found",
+                    "home", "shop", "store", "catalog", "products"
+                ]
+                
+                if not any(phrase in text.lower() for phrase in skip_phrases):
+                    return text
+                    
+        except Exception as e:
+            logger.debug(f"Error extracting with selector '{sel}': {e}")
+            continue
+    
     return None
 
 
 def process_single_url(record: UrlRecord) -> Dict:
+    """Process a single URL and extract product name"""
     html = http_get(record.url)
     product_name = None
     status = "failed"
     
     if html:
         product_name = extract_product_name(html)
-        status = "success" if product_name else "no_name_found"
+        if product_name:
+            status = "success"
+        else:
+            status = "no_name_found"
+            # Log debug info for failed extractions
+            logger.debug(f"No name found for {record.url[:50]}...")
     else:
         status = "no_html"
+        logger.debug(f"No HTML for {record.url[:50]}...")
     
     return {
         "product_id": record.product_id,
