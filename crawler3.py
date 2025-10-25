@@ -135,16 +135,16 @@ def stream_filtered_data_batches(batch_size: int = BATCH_SIZE) -> Generator[List
         # Fallback to CSV streaming
         logger.info(
             f"📂 Streaming data from {FILTERED_CSV} in batches of {batch_size}")
-                with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
+        with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row_num, row in enumerate(reader, 1):
                 # Add all records, not just first per product_id
                 current_batch.append(row)
-                    
+
                 if len(current_batch) >= batch_size:
                     yield current_batch
                     current_batch = []
-                        
+
                     if check_memory_limit():
                         force_garbage_collection()
 
@@ -153,7 +153,7 @@ def stream_filtered_data_batches(batch_size: int = BATCH_SIZE) -> Generator[List
         yield current_batch
 
     logger.info(
-        f"✅ Finished streaming. Total unique product IDs: {len(product_ids_seen)}")
+        f"✅ Finished streaming. Total records processed.")
 
 
 def count_total_products_streaming() -> int:
