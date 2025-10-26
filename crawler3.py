@@ -42,7 +42,7 @@ CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
 
 # Có thể thay đổi level để debug
-DEBUG_MODE = True  # Set True để enable debug logging
+DEBUG_MODE = False  # Set True để enable debug logging
 
 log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
 logging.basicConfig(level=log_level,
@@ -400,7 +400,55 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     return results
 
 
-# Removed deduplicate_by_product_id function since data_filter.py already ensures unique product_ids
+def deduplicate_by_product_id(candidates: List[Dict]) -> List[Dict]:
+    """
+    Deduplicate candidates by product_id, keeping only the best result for each product.
+    Prioritizes records with product_name (status='success').
+    """
+    if not candidates:
+        return []
+    
+    # Group by product_id
+    grouped = {}
+    for row in candidates:
+        pid = row.get("product_id")
+        if not pid:
+            continue
+            
+        status = row.get("status", "unknown")
+        has_name = bool(row.get("product_name"))
+        
+        if pid not in grouped:
+            # First occurrence
+            grouped[pid] = row
+        else:
+            # Already have a record for this product_id
+            existing_status = grouped[pid].get("status", "unknown")
+            existing_has_name = bool(grouped[pid].get("product_name"))
+            
+            # Priority: records with product_name > records without name
+            if has_name and not existing_has_name:
+                # New record has name, existing doesn't -> replace
+                grouped[pid] = row
+            elif has_name and existing_has_name:
+                # Both have name, keep the one with better status
+                if status == "success" and existing_status != "success":
+                    grouped[pid] = row
+                # Otherwise keep existing
+            # If new record has no name, keep existing
+    
+    # Convert back to list
+    unique_list = list(grouped.values())
+    
+    # Log deduplication stats
+    original_count = len(candidates)
+    unique_count = len(unique_list)
+    if original_count != unique_count:
+        logger.info(
+            f"🔗 Deduplicated: {original_count} -> {unique_count} unique products "
+            f"(removed {original_count - unique_count} duplicates)")
+    
+    return unique_list
 
 
 def append_candidates_jsonl(candidates: List[Dict], path: str = CANDIDATES_JSONL) -> None:
@@ -478,18 +526,25 @@ def main():
         # Process URLs in parallel
         candidates = crawl_product_names_parallel(url_records)
 
+        # Deduplicate by product_id (keep best result per product)
+        unique_candidates = deduplicate_by_product_id(candidates)
+
         # Save results
-        append_candidates_jsonl(candidates)
-        append_final_csv(candidates)
+        append_candidates_jsonl(candidates)  # Save all results to JSONL
+        append_final_csv(unique_candidates)  # Save only unique products to CSV
 
-        # Update statistics
-        processed_batch = len(candidates)
+        # Update existing_pids to track processed products
+        for row in unique_candidates:
+            existing_pids.add(row.get("product_id"))
+
+        # Update statistics (use unique_candidates for accurate counts)
+        processed_batch = len(unique_candidates)
         with_name_batch = sum(
-            1 for row in candidates if row.get("product_name"))
+            1 for row in unique_candidates if row.get("product_name"))
 
-        # Thống kê chi tiết
+        # Thống kê chi tiết (use unique_candidates for status breakdown)
         status_counts = {}
-        for row in candidates:
+        for row in unique_candidates:
             status = row.get("status", "unknown")
             status_counts[status] = status_counts.get(status, 0) + 1
 
