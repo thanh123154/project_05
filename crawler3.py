@@ -13,12 +13,13 @@ from typing import Dict, List, Optional, Set, Generator
 import requests
 try:
     import cloudscraper  # optional, improves odds against Cloudflare
-    _cf_scraper = cloudscraper.create_scraper()
+    _cf_scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
 except Exception:
     _cf_scraper = None
 from bs4 import BeautifulSoup
 import os
 import re
+import os
 from urllib.parse import urlparse
 
 # -----------------------------
@@ -59,6 +60,33 @@ logger = logging.getLogger(__name__)
 # limit how many debug HTML files we save
 _DEBUG_HTML_SAVED = 0
 _DEBUG_HTML_MAX = 5
+
+# Proxy configuration (env-driven)
+def _build_proxies() -> Optional[Dict[str, str]]:
+    try:
+        # Priority: explicit HTTP(S)_PROXY envs; fallback to PROXY_URL
+        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        proxy_url = os.environ.get("PROXY_URL")
+        if proxy_url and not (http_proxy or https_proxy):
+            http_proxy = proxy_url
+            https_proxy = proxy_url
+
+        if http_proxy or https_proxy:
+            proxies = {}
+            if http_proxy:
+                proxies["http"] = http_proxy
+            if https_proxy:
+                proxies["https"] = https_proxy
+            masked_http = (http_proxy or "").split("@")[-1]
+            masked_https = (https_proxy or "").split("@")[-1]
+            logger.info(f"🌐 Using proxy - http: {masked_http or '-'} | https: {masked_https or '-'}")
+            return proxies
+    except Exception as e:
+        logger.warning(f"Proxy config error: {e}")
+    return None
+
+_PROXIES = _build_proxies()
 
 try:
     from tqdm import tqdm
@@ -293,13 +321,26 @@ def http_get(url: str) -> Optional[str]:
             # Prefer cloudscraper for Glamira domains (more bot protection)
             if _cf_scraper is not None and ("glamira." in host):
                 try:
-                    resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                    resp = _cf_scraper.get(
+                        url,
+                        headers=headers,
+                        timeout=DEFAULT_TIMEOUT_SECONDS,
+                        allow_redirects=True,
+                        verify=False,
+                        proxies=_PROXIES,
+                    )
                 except Exception:
                     resp = None
 
             if resp is None:
-                resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                    allow_redirects=True, verify=True)
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=DEFAULT_TIMEOUT_SECONDS,
+                    allow_redirects=True,
+                    verify=False,
+                    proxies=_PROXIES,
+                )
 
             if resp.status_code == 200:
                 # Skip known redirects to cart pages
@@ -318,17 +359,33 @@ def http_get(url: str) -> Optional[str]:
                 # try cloudscraper fallback
                 if _cf_scraper is not None:
                     try:
-                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                        cf_resp = _cf_scraper.get(
+                            url,
+                            headers=headers,
+                            timeout=DEFAULT_TIMEOUT_SECONDS,
+                            allow_redirects=True,
+                            verify=False,
+                            proxies=_PROXIES,
+                        )
                         if cf_resp.status_code == 200:
                             return cf_resp.text
                     except Exception:
                         pass
+                else:
+                    logger.info(f"HTTP 403 after attempts for {url}")
                 return None
             elif resp.status_code in (429, 503):
                 # possible bot protection; try cloudscraper once
                 if _cf_scraper is not None:
                     try:
-                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                        cf_resp = _cf_scraper.get(
+                            url,
+                            headers=headers,
+                            timeout=DEFAULT_TIMEOUT_SECONDS,
+                            allow_redirects=True,
+                            verify=False,
+                            proxies=_PROXIES,
+                        )
                         if cf_resp.status_code == 200:
                             return cf_resp.text
                     except Exception:
