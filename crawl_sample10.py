@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import argparse
 from typing import Dict, List, Optional
 
 import crawler3
@@ -14,7 +15,7 @@ from crawler3 import (
 
 INPUT_JSONL = "product_urls.jsonl"
 INPUT_CSV = "merged_data.csv"
-SAMPLE_SIZE = 10
+DEFAULT_SAMPLE_SIZE = 10
 
 SAMPLE_CANDIDATES_JSONL = "product_name_candidates_sample.jsonl"
 SAMPLE_FINAL_CSV = "product_names_sample.csv"
@@ -24,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def read_first_n_records(n: int = SAMPLE_SIZE) -> List[Dict]:
+def read_first_n_records(n: int, domain_contains: Optional[str]) -> List[Dict]:
     records: List[Dict] = []
     seen_products = set()
 
@@ -39,7 +40,10 @@ def read_first_n_records(n: int = SAMPLE_SIZE) -> List[Dict]:
                 pid = row.get("product_id")
                 if not pid or pid in seen_products:
                     continue
-                if not is_likely_product_url(row.get("url")):
+                url = row.get("url")
+                if domain_contains and (not url or domain_contains not in url):
+                    continue
+                if not is_likely_product_url(url):
                     continue
                 seen_products.add(pid)
                 records.append(row)
@@ -56,7 +60,10 @@ def read_first_n_records(n: int = SAMPLE_SIZE) -> List[Dict]:
                 pid = row.get("product_id")
                 if not pid or pid in seen_products:
                     continue
-                if not is_likely_product_url(row.get("url")):
+                url = row.get("url")
+                if domain_contains and (not url or domain_contains not in url):
+                    continue
+                if not is_likely_product_url(url):
                     continue
                 seen_products.add(pid)
                 records.append(row)
@@ -100,6 +107,12 @@ def append_final_csv(candidates: List[Dict], path: str = SAMPLE_FINAL_CSV) -> No
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Crawl sample product names")
+    parser.add_argument("--n", type=int, default=DEFAULT_SAMPLE_SIZE, help="number of products to test")
+    parser.add_argument("--domain", type=str, default=None, help="filter URLs containing this substring (e.g. glamira.at)")
+    parser.add_argument("--show-urls", action="store_true", help="print selected URLs before crawling")
+    args = parser.parse_args()
+
     # Tweak crawler settings for gentle sample run
     try:
         crawler3.MAX_WORKERS = max(1, min(5, crawler3.MAX_WORKERS))
@@ -108,7 +121,7 @@ def main():
     except Exception:
         pass
 
-    sample_records = read_first_n_records(SAMPLE_SIZE)
+    sample_records = read_first_n_records(args.n, args.domain)
     if not sample_records:
         logger.error("No input records available to test.")
         return
@@ -117,6 +130,11 @@ def main():
     if not url_records:
         logger.error("No valid URL records built from input.")
         return
+
+    if args.show_urls:
+        logger.info("Selected URLs for sample crawl:")
+        for r in url_records:
+            logger.info(f"- {r.url}")
 
     logger.info(f"Testing crawl for {len(url_records)} products...")
     candidates = crawl_product_names_parallel(url_records)
