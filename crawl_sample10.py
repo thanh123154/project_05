@@ -3,6 +3,7 @@ import json
 import logging
 from typing import Dict, List, Optional
 
+import crawler3
 from crawler3 import (
     UrlRecord,
     process_batch_data,
@@ -94,6 +95,14 @@ def append_final_csv(candidates: List[Dict], path: str = SAMPLE_FINAL_CSV) -> No
 
 
 def main():
+    # Tweak crawler settings for gentle sample run
+    try:
+        crawler3.MAX_WORKERS = max(1, min(5, crawler3.MAX_WORKERS))
+        crawler3.DEFAULT_TIMEOUT_SECONDS = max(15, crawler3.DEFAULT_TIMEOUT_SECONDS)
+        crawler3.DEBUG_MODE = True
+    except Exception:
+        pass
+
     sample_records = read_first_n_records(SAMPLE_SIZE)
     if not sample_records:
         logger.error("No input records available to test.")
