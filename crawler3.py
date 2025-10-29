@@ -91,6 +91,34 @@ def _safe_str(value: object) -> Optional[str]:
     return str(value).strip() or None
 
 
+def is_likely_product_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        # Exclude obvious non-product paths
+        exclude_tokens = [
+            '/cart', '/checkout', '/customer', '/account', '/login', '/logout',
+            '/wishlist', '/compare', '/search', '/catalog/category', '/contact',
+            '/privacy', '/terms', '/cookies', '/newsletter', '/order', '/payment',
+        ]
+        if any(tok in path for tok in exclude_tokens):
+            return False
+
+        # Heuristic: product pages typically end with .html and have a slug
+        if path.endswith('.html') and len(path.strip('/').split('/')) >= 1:
+            return True
+
+        # Allow some common product markers
+        product_markers = ['product', 'prod', 'glamira-']
+        if any(pm in path for pm in product_markers):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def get_memory_usage_mb() -> float:
     """Get current memory usage in MB"""
     process = psutil.Process()
@@ -197,7 +225,7 @@ def process_batch_data(batch_data: List[Dict]) -> List[UrlRecord]:
         url = record.get('url')
         source_collection = record.get('source_collection', 'unknown')
 
-        if product_id and url:
+        if product_id and url and is_likely_product_url(url):
             url_records.append(UrlRecord(
                 product_id=product_id,
                 url=_safe_str(url),

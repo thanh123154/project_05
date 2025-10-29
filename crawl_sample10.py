@@ -9,6 +9,7 @@ from crawler3 import (
     process_batch_data,
     crawl_product_names_parallel,
     deduplicate_by_product_id,
+    is_likely_product_url,
 )
 
 INPUT_JSONL = "product_urls.jsonl"
@@ -38,6 +39,8 @@ def read_first_n_records(n: int = SAMPLE_SIZE) -> List[Dict]:
                 pid = row.get("product_id")
                 if not pid or pid in seen_products:
                     continue
+                if not is_likely_product_url(row.get("url")):
+                    continue
                 seen_products.add(pid)
                 records.append(row)
                 if len(records) >= n:
@@ -52,6 +55,8 @@ def read_first_n_records(n: int = SAMPLE_SIZE) -> List[Dict]:
             for row in reader:
                 pid = row.get("product_id")
                 if not pid or pid in seen_products:
+                    continue
+                if not is_likely_product_url(row.get("url")):
                     continue
                 seen_products.add(pid)
                 records.append(row)
