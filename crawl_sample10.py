@@ -153,6 +153,13 @@ def main():
     else:
         logger.info("No product names extracted in the sample run.")
 
+    # Show status breakdown
+    status_counts: Dict[str, int] = {}
+    for row in unique_candidates:
+        status = row.get("status", "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    logger.info(f"Status breakdown: {status_counts}")
+
 
 if __name__ == "__main__":
     main()

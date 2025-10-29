@@ -542,6 +542,38 @@ def extract_product_name(html: str) -> Optional[str]:
     return None
 
 
+
+def _derive_name_from_slug(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        path = parsed.path
+        if not path or ".html" not in path:
+            return None
+        slug = path.rsplit('/', 1)[-1]
+        slug = slug.split('.html', 1)[0]
+        # remove common prefixes
+        prefixes = [
+            'glamira-', 'bague-', 'ring-', 'anneau-', 'verlobungsring-', 'eheringe-',
+            'pierscionki-', 'prsten-', 'collier-', 'pendant-', 'necklace-', 'earring-'
+        ]
+        for p in prefixes:
+            if slug.startswith(p):
+                slug = slug[len(p):]
+                break
+        # normalize hyphens/underscores
+        words = [w for w in re.split(r"[-_]+", slug) if w]
+        if not words:
+            return None
+        # title case but keep numbers and units as-is
+        name = " ".join(w.capitalize() if w.isalpha() else w for w in words)
+        # sanity length
+        if 2 < len(name) < 200:
+            return name
+    except Exception:
+        return None
+    return None
+
+
 def process_single_url(record: UrlRecord) -> Dict:
     """Process a single URL and extract product name"""
     html = http_get(record.url)
@@ -551,6 +583,19 @@ def process_single_url(record: UrlRecord) -> Dict:
     if html:
         # Skip non-product pages (e.g., cart) that passed through
         if is_non_product_page(html):
+            # Save debug snapshot too
+            global _DEBUG_HTML_SAVED
+            if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
+                try:
+                    parsed = urlparse(record.url)
+                    host = (parsed.hostname or 'unknown').replace(':', '_')
+                    fname = f"debug_html_{host}_{int(time.time())}_{_DEBUG_HTML_SAVED}.html"
+                    with open(fname, 'w', encoding='utf-8') as f:
+                        f.write(html)
+                    logger.info(f"🧪 Saved debug HTML to {fname}")
+                    _DEBUG_HTML_SAVED += 1
+                except Exception:
+                    pass
             return {
                 "product_id": record.product_id,
                 "url": record.url,
@@ -560,8 +605,14 @@ def process_single_url(record: UrlRecord) -> Dict:
                 "fetched_at": int(time.time()),
             }
         product_name = extract_product_name(html)
-        if product_name:
-            status = "success"
+        if not product_name:
+            # heuristics from URL slug for Glamira-like pages
+            slug_name = _derive_name_from_slug(record.url)
+            if slug_name:
+                product_name = slug_name
+                status = "slug_heuristic"
+            else:
+                status = "no_name_found"
         else:
             status = "no_name_found"
             # Log debug info for failed extractions
@@ -579,6 +630,8 @@ def process_single_url(record: UrlRecord) -> Dict:
                     _DEBUG_HTML_SAVED += 1
                 except Exception:
                     pass
+        if product_name and status == "no_name_found":
+            status = "success"
     else:
         status = "no_html"
         logger.debug(f"No HTML for {record.url[:50]}...")
