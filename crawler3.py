@@ -119,6 +119,42 @@ def is_likely_product_url(url: Optional[str]) -> bool:
     return False
 
 
+def estimate_accept_language(url: str) -> str:
+    """Heuristic Accept-Language based on TLD/host to reduce locale redirects"""
+    try:
+        host = urlparse(url).hostname or ""
+        tld = host.rsplit('.', 1)[-1].lower() if '.' in host else ''
+        mapping = {
+            'de': 'de-DE,de;q=0.8,en;q=0.5',
+            'at': 'de-AT,de;q=0.8,en;q=0.5',
+            'ch': 'de-CH,de;q=0.8,fr-CH;q=0.6,en;q=0.5',
+            'fr': 'fr-FR,fr;q=0.8,en;q=0.5',
+            'be': 'fr-BE,fr;q=0.8,nl-BE;q=0.6,en;q=0.5',
+            'it': 'it-IT,it;q=0.8,en;q=0.5',
+            'es': 'es-ES,es;q=0.8,en;q=0.5',
+            'pt': 'pt-PT,pt;q=0.8,en;q=0.5',
+            'pl': 'pl-PL,pl;q=0.8,en;q=0.5',
+            'cz': 'cs-CZ,cs;q=0.8,en;q=0.5',
+            'au': 'en-AU,en;q=0.8',
+            'uk': 'en-GB,en;q=0.8',
+        }
+        return mapping.get(tld, 'en-US,en;q=0.8')
+    except Exception:
+        return 'en-US,en;q=0.8'
+
+
+def is_non_product_page(html: str) -> bool:
+    lower = html.lower()
+    # dataLayer pageType cart, or explicit cart page markers
+    if '"pagetype":"checkout_cart_index"' in lower:
+        return True
+    if '<meta name="robots" content="noindex,nofollow"' in lower and 'warenkorb' in lower:
+        return True
+    if '<title>warenkorb' in lower or 'checkout/cart/' in lower:
+        return True
+    return False
+
+
 def get_memory_usage_mb() -> float:
     """Get current memory usage in MB"""
     process = psutil.Process()
@@ -244,7 +280,7 @@ def http_get(url: str) -> Optional[str]:
             headers = {
                 "User-Agent": random.choice(USER_AGENTS),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Language": estimate_accept_language(url),
                 "Accept-Encoding": "gzip, deflate",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
@@ -255,6 +291,13 @@ def http_get(url: str) -> Optional[str]:
                                 allow_redirects=True, verify=True)
 
             if resp.status_code == 200:
+                # Skip known redirects to cart pages
+                try:
+                    final_path = urlparse(resp.url).path.lower()
+                    if '/checkout/cart' in final_path:
+                        return None
+                except Exception:
+                    pass
                 return resp.text
             elif resp.status_code == 404:
                 logger.debug(f"404 Not Found: {url}")
@@ -495,6 +538,16 @@ def process_single_url(record: UrlRecord) -> Dict:
     status = "failed"
 
     if html:
+        # Skip non-product pages (e.g., cart) that passed through
+        if is_non_product_page(html):
+            return {
+                "product_id": record.product_id,
+                "url": record.url,
+                "source_collection": record.source_collection,
+                "product_name": None,
+                "status": "non_product_page",
+                "fetched_at": int(time.time()),
+            }
         product_name = extract_product_name(html)
         if product_name:
             status = "success"
