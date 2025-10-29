@@ -287,8 +287,19 @@ def http_get(url: str) -> Optional[str]:
                 "Referer": f"{urlparse(url).scheme}://{urlparse(url).hostname or ''}/",
             }
 
-            resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                allow_redirects=True, verify=True)
+            host = urlparse(url).hostname or ""
+            resp = None
+
+            # Prefer cloudscraper for Glamira domains (more bot protection)
+            if _cf_scraper is not None and ("glamira." in host):
+                try:
+                    resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                except Exception:
+                    resp = None
+
+            if resp is None:
+                resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
+                                    allow_redirects=True, verify=True)
 
             if resp.status_code == 200:
                 # Skip known redirects to cart pages

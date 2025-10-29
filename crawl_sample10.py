@@ -115,8 +115,8 @@ def main():
 
     # Tweak crawler settings for gentle sample run
     try:
-        crawler3.MAX_WORKERS = max(1, min(5, crawler3.MAX_WORKERS))
-        crawler3.DEFAULT_TIMEOUT_SECONDS = max(15, crawler3.DEFAULT_TIMEOUT_SECONDS)
+        crawler3.MAX_WORKERS = 3
+        crawler3.DEFAULT_TIMEOUT_SECONDS = max(25, crawler3.DEFAULT_TIMEOUT_SECONDS)
         crawler3.DEBUG_MODE = True
     except Exception:
         pass
