@@ -576,6 +576,7 @@ def _derive_name_from_slug(url: str) -> Optional[str]:
 
 def process_single_url(record: UrlRecord) -> Dict:
     """Process a single URL and extract product name"""
+    global _DEBUG_HTML_SAVED
     html = http_get(record.url)
     product_name = None
     status = "failed"
@@ -584,7 +585,6 @@ def process_single_url(record: UrlRecord) -> Dict:
         # Skip non-product pages (e.g., cart) that passed through
         if is_non_product_page(html):
             # Save debug snapshot too
-            global _DEBUG_HTML_SAVED
             if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
                 try:
                     parsed = urlparse(record.url)
@@ -618,7 +618,6 @@ def process_single_url(record: UrlRecord) -> Dict:
             # Log debug info for failed extractions
             logger.debug(f"No name found for {record.url[:50]}...")
             # save a few samples for diagnosis
-            global _DEBUG_HTML_SAVED
             if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
                 try:
                     parsed = urlparse(record.url)
