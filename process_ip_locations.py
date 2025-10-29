@@ -94,11 +94,14 @@ def get_unique_ips(limit: Optional[int] = None) -> List[str]:
 
 def safe_float(value) -> Optional[float]:
     """Safely convert value to float, handling None and empty strings"""
-    if value is None or value == '' or value == 'N/A':
+    if value is None or value == '' or value == 'N/A' or value == '-':
         return None
     try:
         val = float(value)
-        return val if not (val == -1.0 or val == -999): None  # IP2Location uses -1 for "not available"
+        # IP2Location uses -1 and -999 for "not available"
+        if val == -1.0 or val == -999:
+            return None
+        return val
     except (ValueError, TypeError):
         return None
 
