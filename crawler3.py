@@ -18,6 +18,7 @@ except Exception:
     _cf_scraper = None
 from bs4 import BeautifulSoup
 import os
+import re
 from urllib.parse import urlparse
 
 # -----------------------------
@@ -331,6 +332,32 @@ def extract_product_name(html: str) -> Optional[str]:
     except Exception:
         pass
 
+    # Try Google Tag Manager dataLayer pushes (often contains sku/name)
+    try:
+        matches = re.findall(r"window\\.dataLayer\\.push\\((\{[\s\S]*?\})\)\s*;?", html)
+        for m in matches:
+            try:
+                obj = json.loads(m)
+            except Exception:
+                # attempt to fix common trailing commas
+                try:
+                    fixed = re.sub(r",\s*([}\]])", r"\1", m)
+                    obj = json.loads(fixed)
+                except Exception:
+                    continue
+            if not isinstance(obj, dict):
+                continue
+            product = obj.get("product") or obj.get("ecommerce", {}).get("detail", {}).get("products", [{}])[0]
+            if isinstance(product, dict):
+                candidate = product.get("name") or product.get("sku") or product.get("parent_sku")
+                if candidate and 2 < len(str(candidate)) < 200:
+                    cleaned = str(candidate).strip()
+                    cleaned = cleaned.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+                    cleaned = " ".join(cleaned.split())
+                    return cleaned
+    except Exception:
+        pass
+
     # Thêm nhiều selector hơn để tìm product name
     selectors = [
         # Magento specific
@@ -387,6 +414,18 @@ def extract_product_name(html: str) -> Optional[str]:
                 for sep in [" | ", " - ", " — ", " – "]:
                     if sep in text:
                         text = text.split(sep)[0].strip()
+
+                # light prefix cleanup for common marketing prefixes
+                marketing_prefixes = [
+                    "Kaufen Sie ",  # de
+                    "Achetez ",     # fr
+                    "Acheter ",
+                    "Buy ",         # en
+                    "Compra ",      # es/it
+                ]
+                for pref in marketing_prefixes:
+                    if text.startswith(pref):
+                        text = text[len(pref):].strip()
 
                 # Skip common non-product text
                 skip_phrases = [
