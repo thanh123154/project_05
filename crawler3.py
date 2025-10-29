@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 import os
 import re
 import os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 # -----------------------------
 # Configurations
@@ -181,6 +181,18 @@ def is_non_product_page(html: str) -> bool:
     if '<title>warenkorb' in lower or 'checkout/cart/' in lower:
         return True
     return False
+
+
+def _extract_canonical_url(html: str) -> Optional[str]:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        link = soup.find("link", rel=lambda v: v and "canonical" in str(v).lower())
+        if link:
+            href = (link.get("href") or "").strip()
+            return href or None
+    except Exception:
+        return None
+    return None
 
 
 def get_memory_usage_mb() -> float:
@@ -640,6 +652,26 @@ def process_single_url(record: UrlRecord) -> Dict:
 
     if html:
         # Skip non-product pages (e.g., cart) that passed through
+        if is_non_product_page(html):
+            # attempt recovery: try canonical URL or strip query params once
+            recovered_html = None
+            new_url = _extract_canonical_url(html)
+            if not new_url:
+                try:
+                    parsed = urlparse(record.url)
+                    new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+                except Exception:
+                    new_url = None
+
+            if new_url and new_url != record.url:
+                recovered_html = http_get(new_url)
+                if recovered_html and not is_non_product_page(recovered_html):
+                    html = recovered_html
+                    record = UrlRecord(product_id=record.product_id, url=new_url, source_collection=record.source_collection)
+                else:
+                    recovered_html = None
+
+        # Re-check after potential recovery
         if is_non_product_page(html):
             # Save debug snapshot too
             if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
