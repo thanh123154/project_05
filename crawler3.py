@@ -200,6 +200,8 @@ def http_get(url: str) -> Optional[str]:
     """Get HTML content from URL with detailed error handling"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            # small jitter helps avoid burst patterns
+            time.sleep(random.uniform(0.0, 0.2))
             headers = {
                 "User-Agent": random.choice(USER_AGENTS),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -240,12 +242,65 @@ def http_get(url: str) -> Optional[str]:
 
 
 def extract_product_name(html: str) -> Optional[str]:
-    """Extract product name from HTML with improved selectors"""
+    """Extract product name from HTML with improved selectors and JSON-LD parsing"""
+    # quick bot-wall detection to avoid returning incorrect titles
+    lower_html = html.lower()
+    bot_wall_indicators = ["cloudflare", "captcha", "attention required", "access denied"]
+    if any(ind in lower_html for ind in bot_wall_indicators):
+        return None
+
     soup = BeautifulSoup(html, "html.parser")
 
     # Loại bỏ script và style tags
     for script in soup(["script", "style"]):
         script.decompose()
+
+    # Try JSON-LD first (schema.org Product)
+    try:
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                data = json.loads(script.string or "")
+            except Exception:
+                continue
+
+            def extract_name(obj) -> Optional[str]:
+                if not isinstance(obj, dict):
+                    return None
+                context = obj.get("@context", "") or ""
+                obj_type = obj.get("@type", "") or ""
+                # Direct Product
+                if str(obj_type).lower() == "product" and obj.get("name"):
+                    return str(obj["name"]).strip()
+                # Graph list
+                if "@graph" in obj and isinstance(obj["@graph"], list):
+                    for node in obj["@graph"]:
+                        n = extract_name(node)
+                        if n:
+                            return n
+                # Offers nested
+                if "offers" in obj and isinstance(obj["offers"], dict):
+                    n = obj["offers"].get("name")
+                    if n:
+                        return str(n).strip()
+                return None
+
+            candidate = extract_name(data)
+            if candidate and 3 < len(candidate) < 200:
+                # fall through to cleanup below
+                cleaned = candidate.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+                cleaned = " ".join(cleaned.split())
+                # basic site suffix stripping
+                for sep in [" | ", " - ", " — ", " – "]:
+                    if sep in cleaned:
+                        cleaned = cleaned.split(sep)[0].strip()
+                # remove common brand tokens at ends
+                for token in ["glamira", "store", "shop"]:
+                    if cleaned.lower().endswith(token):
+                        cleaned = cleaned[: -len(token)].strip(" -|•")
+                if cleaned and 3 < len(cleaned) < 200:
+                    return cleaned
+    except Exception:
+        pass
 
     # Thêm nhiều selector hơn để tìm product name
     selectors = [
@@ -281,6 +336,7 @@ def extract_product_name(html: str) -> Optional[str]:
 
     for sel in selectors:
         try:
+            text = None
             if sel.startswith("meta"):
                 el = soup.select_one(sel)
                 if el:
@@ -295,6 +351,11 @@ def extract_product_name(html: str) -> Optional[str]:
                 text = text.replace('\n', ' ').replace(
                     '\t', ' ').replace('\r', ' ')
                 text = ' '.join(text.split())  # Remove extra whitespace
+
+                # strip site suffixes sometimes present in titles
+                for sep in [" | ", " - ", " — ", " – "]:
+                    if sep in text:
+                        text = text.split(sep)[0].strip()
 
                 # Skip common non-product text
                 skip_phrases = [
@@ -531,7 +592,10 @@ def main():
 
         # Save results
         append_candidates_jsonl(candidates)  # Save all results to JSONL
-        append_final_csv(unique_candidates)  # Save only unique products to CSV
+        # Only write rows that actually have a product_name to the final CSV
+        named_only = [row for row in unique_candidates if row.get("product_name")]
+        if named_only:
+            append_final_csv(named_only)  # Save only products with names to CSV
 
         # Update existing_pids to track processed products
         for row in unique_candidates:
@@ -539,8 +603,7 @@ def main():
 
         # Update statistics (use unique_candidates for accurate counts)
         processed_batch = len(unique_candidates)
-        with_name_batch = sum(
-            1 for row in unique_candidates if row.get("product_name"))
+        with_name_batch = len(named_only)
 
         # Thống kê chi tiết (use unique_candidates for status breakdown)
         status_counts = {}

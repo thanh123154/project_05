@@ -11,13 +11,26 @@ import time
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 import os
 
 import pymongo
 from IP2Location import IP2Location
 from tqdm import tqdm
+
+# Initialize DB once at module level for multiprocessing
+_ip_db = None
+
+
+def _init_ip_db():
+    """Initialize IP2Location database once"""
+    global _ip_db
+    if _ip_db is None:
+        logger.info(f"📂 Initializing IP2Location DB from: {IP2LOCATION_DB_PATH}")
+        _ip_db = IP2Location(IP2LOCATION_DB_PATH)
+        logger.info(f"✅ IP2Location DB loaded successfully")
+    return _ip_db
 
 # -----------------------------
 # Configurations
@@ -79,23 +92,54 @@ def get_unique_ips(limit: Optional[int] = None) -> List[str]:
     return ips
 
 
+def safe_float(value) -> Optional[float]:
+    """Safely convert value to float, handling None and empty strings"""
+    if value is None or value == '' or value == 'N/A':
+        return None
+    try:
+        val = float(value)
+        return val if not (val == -1.0 or val == -999): None  # IP2Location uses -1 for "not available"
+    except (ValueError, TypeError):
+        return None
+
+
 def lookup_ip(ip: str) -> IPLocationData:
     """Worker function for ProcessPoolExecutor"""
+    start = time.time()
     try:
-        db = IP2Location(IP2LOCATION_DB_PATH)
+        db = _init_ip_db()
         for attempt in range(RETRY_COUNT + 1):
             try:
-                start = time.time()
                 result = db.get_all(ip)
                 end = time.time()
+                
+                # Debug: Show raw result for first lookup
+                if 'FIRST_LOOKUP_DEBUG' not in globals():
+                    globals()['FIRST_LOOKUP_DEBUG'] = True
+                    logger.info(f"🔍 Raw result for IP {ip}:")
+                    logger.info(f"  - country_short: '{result.country_short}' (type: {type(result.country_short)})")
+                    logger.info(f"  - country_long: '{result.country_long}' (type: {type(result.country_long)})")
+                    logger.info(f"  - region: '{result.region}' (type: {type(result.region)})")
+                    logger.info(f"  - city: '{result.city}' (type: {type(result.city)})")
+                    logger.info(f"  - latitude: '{result.latitude}' (type: {type(result.latitude)})")
+                    logger.info(f"  - longitude: '{result.longitude}' (type: {type(result.longitude)})")
+                
+                # Extract and clean values
+                country_code = result.country_short if result.country_short and result.country_short != '-' else None
+                country_name = result.country_long if result.country_long and result.country_long != '-' else None
+                region_name = result.region if result.region and result.region != '-' else None
+                city_name = result.city if result.city and result.city != '-' else None
+                latitude = safe_float(result.latitude)
+                longitude = safe_float(result.longitude)
+                
                 return IPLocationData(
                     ip=ip,
-                    country_code=result.country_short,
-                    country_name=result.country_long,
-                    region_name=result.region,
-                    city_name=result.city,
-                    latitude=float(result.latitude),
-                    longitude=float(result.longitude),
+                    country_code=country_code,
+                    country_name=country_name,
+                    region_name=region_name,
+                    city_name=city_name,
+                    latitude=latitude,
+                    longitude=longitude,
                     processed_at=int(end),
                     processing_time_ms=(end - start) * 1000
                 )
@@ -116,7 +160,14 @@ def lookup_ip(ip: str) -> IPLocationData:
 
 def process_ips_parallel(ips: List[str]) -> List[IPLocationData]:
     all_results = []
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    
+    # Test first IP lookup to verify DB is working
+    if ips:
+        logger.info(f"🧪 Testing first IP lookup: {ips[0]}")
+        test_result = lookup_ip(ips[0])
+        logger.info(f"🧪 Test result: country={test_result.country_code}, city={test_result.city_name}, lat={test_result.latitude}")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(lookup_ip, ip): ip for ip in ips}
         for f in tqdm(as_completed(futures), total=len(futures), desc="Processing IPs"):
             all_results.append(f.result())
