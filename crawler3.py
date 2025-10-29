@@ -224,7 +224,7 @@ def http_get(url: str) -> Optional[str]:
             }
 
             resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                allow_redirects=True, verify=False)
+                                allow_redirects=True, verify=True)
 
             if resp.status_code == 200:
                 return resp.text
@@ -334,7 +334,9 @@ def extract_product_name(html: str) -> Optional[str]:
 
     # Try Google Tag Manager dataLayer pushes (often contains sku/name)
     try:
-        matches = re.findall(r"window\\.dataLayer\\.push\\((\{[\s\S]*?\})\)\s*;?", html)
+        matches = []
+        matches += re.findall(r"window\\.dataLayer\\.push\\((\{[\s\S]*?\})\)\s*;?", html)
+        matches += re.findall(r"\bdataLayer\\.push\\((\{[\s\S]*?\})\)\s*;?", html)
         for m in matches:
             try:
                 obj = json.loads(m)
@@ -355,6 +357,20 @@ def extract_product_name(html: str) -> Optional[str]:
                     cleaned = cleaned.replace("\n", " ").replace("\t", " ").replace("\r", " ")
                     cleaned = " ".join(cleaned.split())
                     return cleaned
+    except Exception:
+        pass
+
+    # Try window.product structure commonly present on Glamira
+    try:
+        win_prod_match = re.search(r"window\\.product\\s*=\\s*\{[\s\S]*?\};", html)
+        if win_prod_match:
+            block = win_prod_match.group(0)
+            # Try to capture sku from a simpler regex
+            sku_match = re.search(r"product\\.sku\\s*=\\s*['\"]([^'\"]+)['\"]", block)
+            if sku_match:
+                sku_val = sku_match.group(1).strip()
+                if 2 < len(sku_val) < 200:
+                    return sku_val
     except Exception:
         pass
 
@@ -404,7 +420,7 @@ def extract_product_name(html: str) -> Optional[str]:
                 if el:
                     text = el.get_text(strip=True)
 
-            if text and len(text) > 3 and len(text) < 200:  # Reasonable length
+            if text and len(text) > 3 and len(text) < 300:  # Reasonable length (bump max)
                 # Clean up the text
                 text = text.replace('\n', ' ').replace(
                     '\t', ' ').replace('\r', ' ')
@@ -422,6 +438,7 @@ def extract_product_name(html: str) -> Optional[str]:
                     "Acheter ",
                     "Buy ",         # en
                     "Compra ",      # es/it
+                    "Compre ",      # pt
                 ]
                 for pref in marketing_prefixes:
                     if text.startswith(pref):
