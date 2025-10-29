@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Generator
 
 import requests
+try:
+    import cloudscraper  # optional, improves odds against Cloudflare
+    _cf_scraper = cloudscraper.create_scraper()
+except Exception:
+    _cf_scraper = None
 from bs4 import BeautifulSoup
 import os
+from urllib.parse import urlparse
 
 # -----------------------------
 # Configurations
@@ -48,6 +54,10 @@ log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
 logging.basicConfig(level=log_level,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# limit how many debug HTML files we save
+_DEBUG_HTML_SAVED = 0
+_DEBUG_HTML_MAX = 5
 
 try:
     from tqdm import tqdm
@@ -209,6 +219,7 @@ def http_get(url: str) -> Optional[str]:
                 "Accept-Encoding": "gzip, deflate",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
+                "Referer": f"{urlparse(url).scheme}://{urlparse(url).hostname or ''}/",
             }
 
             resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -221,7 +232,25 @@ def http_get(url: str) -> Optional[str]:
                 return None
             elif resp.status_code == 403:
                 logger.debug(f"403 Forbidden: {url}")
+                # try cloudscraper fallback
+                if _cf_scraper is not None:
+                    try:
+                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                        if cf_resp.status_code == 200:
+                            return cf_resp.text
+                    except Exception:
+                        pass
                 return None
+            elif resp.status_code in (429, 503):
+                # possible bot protection; try cloudscraper once
+                if _cf_scraper is not None:
+                    try:
+                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True)
+                        if cf_resp.status_code == 200:
+                            return cf_resp.text
+                    except Exception:
+                        pass
+                logger.debug(f"HTTP {resp.status_code}: {url}")
             else:
                 logger.debug(f"HTTP {resp.status_code}: {url}")
 
@@ -318,6 +347,8 @@ def extract_product_name(html: str) -> Optional[str]:
         ".product-details h1",
         ".product-header h1",
 
+        # Microdata / Schema markers
+        "[itemprop='name']",
         # Data attributes
         "[data-testid='product-title']",
         "[data-testid='product-name']",
@@ -387,6 +418,19 @@ def process_single_url(record: UrlRecord) -> Dict:
             status = "no_name_found"
             # Log debug info for failed extractions
             logger.debug(f"No name found for {record.url[:50]}...")
+            # save a few samples for diagnosis
+            global _DEBUG_HTML_SAVED
+            if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
+                try:
+                    parsed = urlparse(record.url)
+                    host = (parsed.hostname or 'unknown').replace(':', '_')
+                    fname = f"debug_html_{host}_{int(time.time())}_{_DEBUG_HTML_SAVED}.html"
+                    with open(fname, 'w', encoding='utf-8') as f:
+                        f.write(html)
+                    logger.info(f"🧪 Saved debug HTML to {fname}")
+                    _DEBUG_HTML_SAVED += 1
+                except Exception:
+                    pass
     else:
         status = "no_html"
         logger.debug(f"No HTML for {record.url[:50]}...")
