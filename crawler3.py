@@ -185,7 +185,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Crawl product names from URLs")
     parser.add_argument("--input", type=str, default="merged_data.csv")
-    parser.add_argument("--n", type=int, default=100)
+    parser.add_argument("--n", type=int, default=20000)
     args = parser.parse_args()
 
     records = []
