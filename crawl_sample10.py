@@ -5,7 +5,7 @@
 import argparse, csv, json, os, logging
 from typing import List, Optional
 from dataclasses import dataclass
-import crawl3 as prod
+import crawler3 as prod
 
 logger = logging.getLogger(__name__)
 
