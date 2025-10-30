@@ -35,6 +35,17 @@ class UrlRecord:
     url: str
     source_collection: str
 
+def distinct_records(records):
+    """Remove duplicate products by product_id. Only keep the first occurrence."""
+    seen = set()
+    result = []
+    for row in records:
+        pid = str(row.get("product_id")).strip()
+        if pid and pid not in seen:
+            seen.add(pid)
+            result.append(row)
+    return result
+
 # ===============================
 # Core functions
 # ===============================
@@ -190,6 +201,8 @@ if __name__ == "__main__":
         logger.error(f"Failed to read input file: {e}")
         exit(1)
 
+    # Loại sản phẩm trùng theo product_id
+    records = distinct_records(records)
     url_records = process_batch_data(records)
     logger.info(f"Starting crawl for {len(url_records)} URLs...")
     results = crawl_product_names_parallel(url_records)
