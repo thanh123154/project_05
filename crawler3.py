@@ -1,6 +1,3 @@
-# -----------------------------
-# File: crawl3_fixed.py
-# -----------------------------
 import os
 import re
 import json
@@ -9,12 +6,14 @@ import csv
 import requests
 import logging
 from urllib.parse import urlparse
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 import warnings
+import argparse
 
+# Cài đặt để bỏ qua cảnh báo SSL
 warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
 # ===============================
@@ -34,17 +33,6 @@ class UrlRecord:
     product_id: str
     url: str
     source_collection: str
-
-def distinct_records(records):
-    """Remove duplicate products by product_id. Only keep the first occurrence."""
-    seen = set()
-    result = []
-    for row in records:
-        pid = str(row.get("product_id")).strip()
-        if pid and pid not in seen:
-            seen.add(pid)
-            result.append(row)
-    return result
 
 # ===============================
 # Core functions
@@ -71,7 +59,7 @@ def extract_product_name(html: str) -> Optional[str]:
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.string)
-                # JSON-LD may contain list
+                # JSON-LD có thể chứa list
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict) and item.get("@type") == "Product":
@@ -105,49 +93,56 @@ def extract_product_name(html: str) -> Optional[str]:
 
 
 def _derive_name_from_slug(url: str) -> Optional[str]:
+    """Derive product name from URL slug as a last resort."""
     parsed = urlparse(url)
     slug = parsed.path.rsplit('/', 1)[-1]
     slug = slug.split('.html', 1)[0]
+    # Tách slug bằng dấu gạch ngang/dấu gạch dưới
     parts = [w for w in re.split(r"[-_]+", slug) if w]
     if not parts:
         return None
+    # Ghép lại, chỉ giữ lại các từ là chữ cái, viết hoa chữ cái đầu
     name = " ".join(p.capitalize() for p in parts if p.isalpha())
     return name.strip() if name else None
 
 
 def is_likely_product_url(url: str) -> bool:
+    """Tình trạng lọc URL hiện tại của bạn."""
     return "glamira" in (url or "") and ".html" in (url or "")
 
 
-def process_batch_data(batch):
-    out = []
-    for row in batch:
-        pid = str(row.get("product_id")).strip()
-        url = row.get("url")
-        sc = row.get("source_collection", "unknown")
-        if pid and url and is_likely_product_url(url):
-            out.append(UrlRecord(product_id=pid, url=url, source_collection=sc))
-    return out
-
-
-def crawl_product_names_parallel(records: List[UrlRecord], debug_limit: int = 10):
+def crawl_product_names_parallel(records: List[UrlRecord], debug_limit: int = 10) -> List[Dict]:
+    """Crawl sản phẩm và trích xuất tên. Đã sửa lỗi logic trạng thái."""
     results = []
     for idx, rec in enumerate(tqdm(records, desc="Crawling products")):
         html = http_get(rec.url)
         product_name = None
         status = "no_html"
+        
         if html:
+            # 1. Thử trích xuất từ HTML/JSON-LD
             product_name = extract_product_name(html)
-            status = "success" if product_name else "fallback"
-            if not product_name:
-                product_name = _derive_name_from_slug(rec.url)
-            # Save debug HTML for first few pages
+            
+            if product_name:
+                # ✅ SỬA LỖI: Gán trạng thái thành công khi tìm thấy tên
+                status = "success" 
+            else:
+                # 2. Thử slug heuristic
+                slug_name = _derive_name_from_slug(rec.url)
+                if slug_name:
+                    product_name = slug_name
+                    status = "slug_heuristic"
+                else:
+                    status = "no_name_found"
+
+            # Lưu debug HTML cho các trang đầu tiên
             if idx < debug_limit:
                 host = urlparse(rec.url).netloc.replace(".", "_")
-                fname = f"debug_html_{host}_{int(time.time())}_{idx}.html"
+                fname = f"debug_html_{host}_{int(time.time())}_{rec.product_id}.html"
                 with open(fname, "w", encoding="utf-8") as f:
                     f.write(html)
-                logger.info(f"🧪  Saved debug HTML to {fname}")
+                logger.info(f"🧪 Saved debug HTML to {fname}")
+                
         results.append({
             "product_id": rec.product_id,
             "product_name": product_name or "",
@@ -156,7 +151,10 @@ def crawl_product_names_parallel(records: List[UrlRecord], debug_limit: int = 10
             "status": status,
             "fetched_at": int(time.time())
         })
-        logger.info(f"⏳  Progress: {idx+1}/{len(records)} ({(idx+1)/len(records)*100:.1f}%)")
+        # Ghi log tiến trình ít hơn để tránh quá tải console
+        if (idx + 1) % 100 == 0 or idx + 1 == len(records):
+            logger.info(f"⏳ Progress: {idx+1}/{len(records)} ({(idx+1)/len(records)*100:.1f}%)")
+            
     return results
 
 
@@ -178,43 +176,80 @@ def append_final_csv(rows, path="product_names_final.csv"):
 
 
 # ===============================
-# CLI
-# ===============================
+# CLI (ĐÃ SỬA LỖI LỌC DỮ LIỆU ĐẦU VÀO)
+# =================================================================
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Crawl product names from URLs")
-    parser.add_argument("--input", type=str, default="merged_data.csv")
-    parser.add_argument("--n", type=int, default=20000)
+    parser.add_argument("--input", type=str, default="merged_data.csv", help="Input CSV file path")
+    parser.add_argument("--n", type=int, default=20000, help="Max number of *distinct* products to crawl")
     args = parser.parse_args()
 
-    records = []
+    # SỬ DỤNG DICT ĐỂ GOM TẤT CẢ URL VÀ CHỌN URL TỐT NHẤT CHO MỖI PRODUCT_ID
+    best_records: Dict[str, UrlRecord] = {} 
+    total_rows_read = 0
+
+    logger.info(f"Reading input data from {args.input}...")
+
     try:
+        # Đọc dữ liệu thô
         with open(args.input, "r", encoding="utf-8") as f:
+            # LƯU Ý: Đảm bảo fieldnames khớp với cấu trúc file CSV gốc của bạn
             reader = csv.DictReader(f, fieldnames=["product_id", "url", "source_collection", "fetched_at"])
-            for row in reader:
-                if len(records) >= args.n:
+            
+            # Sử dụng tqdm để hiển thị tiến trình đọc file
+            for row in tqdm(reader, desc="Processing input data"):
+                total_rows_read += 1
+                pid = str(row.get("product_id")).strip()
+                url = row.get("url")
+                
+                if not pid or not url:
+                    continue
+
+                # Logic chọn URL TỐT NHẤT cho mỗi ID:
+                is_good_url = is_likely_product_url(url)
+                
+                # A. Nếu chưa có bản ghi nào cho ID này, chọn URL hiện tại
+                if pid not in best_records:
+                    best_records[pid] = UrlRecord(pid, url, row.get("source_collection", "unknown"))
+                
+                # B. Nếu đã có bản ghi, CHỈ CẬP NHẬT nếu URL MỚI TỐT HƠN URL CŨ
+                # (Tức là URL hiện tại là URL không hợp lệ, nhưng URL mới hợp lệ)
+                elif is_good_url and not is_likely_product_url(best_records[pid].url):
+                    best_records[pid] = UrlRecord(pid, url, row.get("source_collection", "unknown"))
+                
+                # Dừng nếu đã đạt đến giới hạn N (dành cho ID duy nhất)
+                if len(best_records) >= args.n:
                     break
-                if is_likely_product_url(row.get("url")):
-                    records.append(row)
+        
     except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
+        logger.error(f"Failed to read input file {args.input}: {e}")
         exit(1)
 
-    # Loại sản phẩm trùng theo product_id
-    records = distinct_records(records)
-    url_records = process_batch_data(records)
+    # Lấy danh sách các bản ghi tốt nhất để crawl (Đã lọc ID duy nhất)
+    url_records = list(best_records.values())
+
+    logger.info(f"Total rows read from input: {total_rows_read}")
+    logger.info(f"Total input (distinct) products: {len(url_records)}") 
+    
+    # -----------------------------------------------------------------
+    # BẮT ĐẦU CRAWL
+    # -----------------------------------------------------------------
     logger.info(f"Starting crawl for {len(url_records)} URLs...")
     results = crawl_product_names_parallel(url_records)
+    
+    # Xử lý kết quả
     append_candidates_jsonl(results)
+    
     named_only = [r for r in results if r.get("product_name")]
-    logger.info(f"Total input (distinct) products: {len(url_records)}")
+    
     logger.info(f"Total successfully crawled product_name: {len(named_only)}")
+    
     if len(named_only) < len(url_records):
         missed = [r['product_id'] for r in results if not r.get("product_name")]
-        logger.warning(f"Products could not be named: {missed}")
+        logger.warning(f"Products could not be named: {missed[:10]}... (Total: {len(missed)})")
+    
     if named_only:
         append_final_csv(named_only)
-        logger.info(f"✅ Saved {len(named_only)} named products.")
+        logger.info(f"✅ Saved {len(named_only)} named products to product_names_final.csv.")
     else:
         logger.warning("⚠️ No product names extracted.")
