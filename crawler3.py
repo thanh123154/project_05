@@ -208,6 +208,11 @@ if __name__ == "__main__":
     results = crawl_product_names_parallel(url_records)
     append_candidates_jsonl(results)
     named_only = [r for r in results if r.get("product_name")]
+    logger.info(f"Total input (distinct) products: {len(url_records)}")
+    logger.info(f"Total successfully crawled product_name: {len(named_only)}")
+    if len(named_only) < len(url_records):
+        missed = [r['product_id'] for r in results if not r.get("product_name")]
+        logger.warning(f"Products could not be named: {missed}")
     if named_only:
         append_final_csv(named_only)
         logger.info(f"✅ Saved {len(named_only)} named products.")
