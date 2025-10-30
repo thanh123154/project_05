@@ -1,3 +1,5 @@
+
+
 import sys
 import csv
 import json
@@ -8,97 +10,89 @@ import gc
 import psutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Generator
+from typing import Dict, List, Optional, Generator
 
 import requests
 try:
-    import cloudscraper  # optional, improves odds against Cloudflare
+    import cloudscraper
     _cf_scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
 except Exception:
     _cf_scraper = None
 from bs4 import BeautifulSoup
 import os
 import re
-import os
 from urllib.parse import urlparse, urlunparse
 
 # -----------------------------
 # Configurations
 # -----------------------------
-# Input files from data_filter.py
 FILTERED_CSV = "merged_data.csv"
 FILTERED_JSONL = "product_urls.jsonl"
 
-DEFAULT_TIMEOUT_SECONDS = 10  # Tăng timeout
-MAX_RETRIES = 3  # Tăng số lần retry
-RETRY_BACKOFF_BASE_SECONDS = 2  # Tăng thời gian chờ giữa các retry
+DEFAULT_TIMEOUT_SECONDS = 12
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE_SECONDS = 2
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
-MAX_WORKERS = 30  # Tăng số workers để xử lý nhanh hơn
-BATCH_SIZE = 1000   # Tăng batch size để giảm overhead
-URLS_PER_PRODUCT = 5  # Giảm số URL per product
-MEMORY_LIMIT_MB = 4096  # Tăng RAM limit để xử lý nhiều data hơn
+MAX_WORKERS = 10
+BATCH_SIZE = 1000
+URLS_PER_PRODUCT = 5
+MEMORY_LIMIT_MB = 4096
 
-# Tùy chọn để force process (bỏ qua existing products)
-FORCE_PROCESS = True  # Set True để xử lý lại tất cả products
-
+FORCE_PROCESS = True
 CANDIDATES_JSONL = "product_name_candidates.jsonl"
 FINAL_CSV = "product_names_final.csv"
+LOG_FILE = "crawl.log"
 
-# Có thể thay đổi level để debug
-DEBUG_MODE = False  # Set True để enable debug logging
+# Logging config (file + console)
+logger = logging.getLogger("crawler")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
-logging.basicConfig(level=log_level,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+fh = logging.FileHandler(LOG_FILE)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
-# limit how many debug HTML files we save
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+# debug html save limits
 _DEBUG_HTML_SAVED = 0
-_DEBUG_HTML_MAX = 5
+_DEBUG_HTML_MAX = 10
 
-# Proxy configuration (env-driven)
+# Proxy support via env
 def _build_proxies() -> Optional[Dict[str, str]]:
     try:
-        # Priority: explicit HTTP(S)_PROXY envs; fallback to PROXY_URL
         http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         proxy_url = os.environ.get("PROXY_URL")
         if proxy_url and not (http_proxy or https_proxy):
             http_proxy = proxy_url
             https_proxy = proxy_url
-
         if http_proxy or https_proxy:
             proxies = {}
             if http_proxy:
                 proxies["http"] = http_proxy
             if https_proxy:
                 proxies["https"] = https_proxy
-            masked_http = (http_proxy or "").split("@")[-1]
-            masked_https = (https_proxy or "").split("@")[-1]
-            logger.info(f"🌐 Using proxy - http: {masked_http or '-'} | https: {masked_https or '-'}")
             return proxies
-    except Exception as e:
-        logger.warning(f"Proxy config error: {e}")
+    except Exception:
+        pass
     return None
 
 _PROXIES = _build_proxies()
 
 try:
     from tqdm import tqdm
-except ImportError:
+except Exception:
     def tqdm(iterable, desc=None, total=None):
         for i, item in enumerate(iterable):
             yield item
-
-# -----------------------------
-# Dataclasses
-# -----------------------------
-
 
 @dataclass
 class UrlRecord:
@@ -106,10 +100,7 @@ class UrlRecord:
     url: str
     source_collection: str
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-
+# Helper utilities
 
 def _safe_str(value: object) -> Optional[str]:
     if value is None:
@@ -124,8 +115,7 @@ def is_likely_product_url(url: Optional[str]) -> bool:
         return False
     try:
         parsed = urlparse(url)
-        path = parsed.path.lower()
-        # Exclude obvious non-product paths
+        path = (parsed.path or "").lower()
         exclude_tokens = [
             '/cart', '/checkout', '/customer', '/account', '/login', '/logout',
             '/wishlist', '/compare', '/search', '/catalog/category', '/contact',
@@ -133,12 +123,8 @@ def is_likely_product_url(url: Optional[str]) -> bool:
         ]
         if any(tok in path for tok in exclude_tokens):
             return False
-
-        # Heuristic: product pages typically end with .html and have a slug
         if path.endswith('.html') and len(path.strip('/').split('/')) >= 1:
             return True
-
-        # Allow some common product markers
         product_markers = ['product', 'prod', 'glamira-']
         if any(pm in path for pm in product_markers):
             return True
@@ -148,7 +134,6 @@ def is_likely_product_url(url: Optional[str]) -> bool:
 
 
 def estimate_accept_language(url: str) -> str:
-    """Heuristic Accept-Language based on TLD/host to reduce locale redirects"""
     try:
         host = urlparse(url).hostname or ""
         tld = host.rsplit('.', 1)[-1].lower() if '.' in host else ''
@@ -173,10 +158,9 @@ def estimate_accept_language(url: str) -> str:
 
 def is_non_product_page(html: str) -> bool:
     lower = html.lower()
-    # dataLayer pageType cart, or explicit cart page markers
-    if '"pagetype":"checkout_cart_index"' in lower:
+    if 'pageType' in lower and 'cart' in lower:
         return True
-    if '<meta name="robots" content="noindex,nofollow"' in lower and 'warenkorb' in lower:
+    if '<meta name="robots" content="noindex,nofollow"' in lower and ('warenkorb' in lower or 'cart' in lower):
         return True
     if '<title>warenkorb' in lower or 'checkout/cart/' in lower:
         return True
@@ -185,10 +169,10 @@ def is_non_product_page(html: str) -> bool:
 
 def _extract_canonical_url(html: str) -> Optional[str]:
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        link = soup.find("link", rel=lambda v: v and "canonical" in str(v).lower())
+        soup = BeautifulSoup(html, 'html.parser')
+        link = soup.find('link', rel=lambda v: v and 'canonical' in str(v).lower())
         if link:
-            href = (link.get("href") or "").strip()
+            href = (link.get('href') or '').strip()
             return href or None
     except Exception:
         return None
@@ -196,126 +180,88 @@ def _extract_canonical_url(html: str) -> Optional[str]:
 
 
 def get_memory_usage_mb() -> float:
-    """Get current memory usage in MB"""
     process = psutil.Process()
     return process.memory_info().rss / 1024 / 1024
 
 
 def check_memory_limit() -> bool:
-    """Check if memory usage exceeds limit"""
     current_mb = get_memory_usage_mb()
     if current_mb > MEMORY_LIMIT_MB:
-        logger.warning(
-            f"⚠️ Memory usage {current_mb:.1f}MB exceeds limit {MEMORY_LIMIT_MB}MB")
+        logger.warning(f"⚠️ Memory usage {current_mb:.1f}MB exceeds limit {MEMORY_LIMIT_MB}MB")
         return True
     return False
 
 
 def force_garbage_collection():
-    """Force garbage collection to free memory"""
     gc.collect()
-    logger.info(
-        f"🧹 Garbage collection completed. Memory: {get_memory_usage_mb():.1f}MB")
+    logger.info(f"🧹 Garbage collection completed. Memory: {get_memory_usage_mb():.1f}MB")
 
 
 def stream_filtered_data_batches(batch_size: int = BATCH_SIZE) -> Generator[List[Dict], None, None]:
-    """Stream filtered data in batches to avoid loading everything into memory"""
-    logger.info(
-        f"📂 Streaming data from {FILTERED_JSONL} in batches of {batch_size}")
-
+    logger.info(f"📂 Streaming data from {FILTERED_JSONL} in batches of {batch_size}")
     current_batch = []
-    # REMOVED: product_ids_seen - allow multiple URLs per product for better coverage
-
     if os.path.exists(FILTERED_JSONL):
         with open(FILTERED_JSONL, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
                 try:
                     record = json.loads(line.strip())
-                    # Add all records, not just first per product_id
                     current_batch.append(record)
-
-                    # Yield batch khi đủ size
                     if len(current_batch) >= batch_size:
                         yield current_batch
                         current_batch = []
-
-                        # Check memory và force GC nếu cần
                         if check_memory_limit():
                             force_garbage_collection()
-
                 except (json.JSONDecodeError, KeyError) as e:
                     logger.warning(f"Skipping invalid line {line_num}: {e}")
                     continue
     else:
-        # Fallback to CSV streaming
-        logger.info(
-            f"📂 Streaming data from {FILTERED_CSV} in batches of {batch_size}")
+        logger.info(f"📂 Streaming data from {FILTERED_CSV} in batches of {batch_size}")
         with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row_num, row in enumerate(reader, 1):
-                # Add all records, not just first per product_id
                 current_batch.append(row)
-
                 if len(current_batch) >= batch_size:
                     yield current_batch
                     current_batch = []
-
                     if check_memory_limit():
                         force_garbage_collection()
-
-    # Yield remaining batch
     if current_batch:
         yield current_batch
-
-    logger.info(
-        f"✅ Finished streaming. Total records processed.")
+    logger.info("✅ Finished streaming. Total records processed.")
 
 
 def count_total_products_streaming() -> int:
-    """Count total unique product IDs without loading all data into memory"""
     product_ids = set()
-
     if os.path.exists(FILTERED_JSONL):
         with open(FILTERED_JSONL, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
                     record = json.loads(line.strip())
                     product_ids.add(record['product_id'])
-                except (json.JSONDecodeError, KeyError):
+                except Exception:
                     continue
     else:
         with open(FILTERED_CSV, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 product_ids.add(row['product_id'])
-
     return len(product_ids)
 
 
 def process_batch_data(batch_data: List[Dict]) -> List[UrlRecord]:
-    """Process a batch of data and convert to UrlRecord list"""
     url_records = []
-
     for record in batch_data:
         product_id = record.get('product_id')
         url = record.get('url')
         source_collection = record.get('source_collection', 'unknown')
-
         if product_id and url and is_likely_product_url(url):
-            url_records.append(UrlRecord(
-                product_id=product_id,
-                url=_safe_str(url),
-                source_collection=source_collection
-            ))
-
+            url_records.append(UrlRecord(product_id=product_id, url=_safe_str(url), source_collection=source_collection))
     return url_records
 
 
 def http_get(url: str) -> Optional[str]:
-    """Get HTML content from URL with detailed error handling"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # small jitter helps avoid burst patterns
             time.sleep(random.uniform(0.0, 0.2))
             headers = {
                 "User-Agent": random.choice(USER_AGENTS),
@@ -326,40 +272,21 @@ def http_get(url: str) -> Optional[str]:
                 "Upgrade-Insecure-Requests": "1",
                 "Referer": f"{urlparse(url).scheme}://{urlparse(url).hostname or ''}/",
             }
-
             host = urlparse(url).hostname or ""
             resp = None
-
-            # Prefer cloudscraper for Glamira domains (more bot protection)
             if _cf_scraper is not None and ("glamira." in host):
                 try:
-                    resp = _cf_scraper.get(
-                        url,
-                        headers=headers,
-                        timeout=DEFAULT_TIMEOUT_SECONDS,
-                        allow_redirects=True,
-                        verify=False,
-                        proxies=_PROXIES,
-                    )
+                    resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True, verify=False, proxies=_PROXIES)
                 except Exception:
                     resp = None
-
             if resp is None:
-                resp = requests.get(
-                    url,
-                    headers=headers,
-                    timeout=DEFAULT_TIMEOUT_SECONDS,
-                    allow_redirects=True,
-                    verify=False,
-                    proxies=_PROXIES,
-                )
-
+                resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True, verify=False, proxies=_PROXIES)
             if resp.status_code == 200:
-                # Skip known redirects to cart pages
                 try:
                     final_path = urlparse(resp.url).path.lower()
-                    if '/checkout/cart' in final_path:
-                        return None
+                    if '/checkout/cart' in final_path or '/cart' in final_path:
+                        logger.debug(f"Redirected to cart for {url} -> {resp.url}")
+                        return resp.text
                 except Exception:
                     pass
                 return resp.text
@@ -368,36 +295,18 @@ def http_get(url: str) -> Optional[str]:
                 return None
             elif resp.status_code == 403:
                 logger.debug(f"403 Forbidden: {url}")
-                # try cloudscraper fallback
                 if _cf_scraper is not None:
                     try:
-                        cf_resp = _cf_scraper.get(
-                            url,
-                            headers=headers,
-                            timeout=DEFAULT_TIMEOUT_SECONDS,
-                            allow_redirects=True,
-                            verify=False,
-                            proxies=_PROXIES,
-                        )
+                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True, verify=False, proxies=_PROXIES)
                         if cf_resp.status_code == 200:
                             return cf_resp.text
                     except Exception:
                         pass
-                else:
-                    logger.info(f"HTTP 403 after attempts for {url}")
                 return None
             elif resp.status_code in (429, 503):
-                # possible bot protection; try cloudscraper once
                 if _cf_scraper is not None:
                     try:
-                        cf_resp = _cf_scraper.get(
-                            url,
-                            headers=headers,
-                            timeout=DEFAULT_TIMEOUT_SECONDS,
-                            allow_redirects=True,
-                            verify=False,
-                            proxies=_PROXIES,
-                        )
+                        cf_resp = _cf_scraper.get(url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS, allow_redirects=True, verify=False, proxies=_PROXIES)
                         if cf_resp.status_code == 200:
                             return cf_resp.text
                     except Exception:
@@ -405,7 +314,6 @@ def http_get(url: str) -> Optional[str]:
                 logger.debug(f"HTTP {resp.status_code}: {url}")
             else:
                 logger.debug(f"HTTP {resp.status_code}: {url}")
-
         except requests.exceptions.Timeout:
             logger.debug(f"Timeout (attempt {attempt}): {url}")
         except requests.exceptions.ConnectionError:
@@ -414,67 +322,49 @@ def http_get(url: str) -> Optional[str]:
             logger.debug(f"Request error (attempt {attempt}): {url} - {e}")
         except Exception as e:
             logger.debug(f"Unexpected error (attempt {attempt}): {url} - {e}")
-
         if attempt < MAX_RETRIES:
             sleep_time = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
             time.sleep(sleep_time)
-
     return None
 
 
 def extract_product_name(html: str) -> Optional[str]:
-    """Extract product name from HTML with improved selectors and JSON-LD parsing"""
-    # quick bot-wall detection to avoid returning incorrect titles
     lower_html = html.lower()
     bot_wall_indicators = ["cloudflare", "captcha", "attention required", "access denied"]
     if any(ind in lower_html for ind in bot_wall_indicators):
         return None
-
     soup = BeautifulSoup(html, "html.parser")
-
-    # Loại bỏ script và style tags
     for script in soup(["script", "style"]):
         script.decompose()
-
-    # Try JSON-LD first (schema.org Product)
     try:
         for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string or "")
             except Exception:
                 continue
-
             def extract_name(obj) -> Optional[str]:
                 if not isinstance(obj, dict):
                     return None
-                context = obj.get("@context", "") or ""
                 obj_type = obj.get("@type", "") or ""
-                # Direct Product
                 if str(obj_type).lower() == "product" and obj.get("name"):
                     return str(obj["name"]).strip()
-                # Graph list
                 if "@graph" in obj and isinstance(obj["@graph"], list):
                     for node in obj["@graph"]:
                         n = extract_name(node)
                         if n:
                             return n
-                # Offers nested
                 if "offers" in obj and isinstance(obj["offers"], dict):
                     n = obj["offers"].get("name")
                     if n:
                         return str(n).strip()
                 return None
-
             candidate = extract_name(data)
             if candidate and 3 < len(candidate) < 200:
-                # fall through to cleanup below
                 cleaned = candidate.replace("\n", " ").replace("\t", " ").replace("\r", " ")
                 cleaned = " ".join(cleaned.split())
-                # basic site suffix stripping
                 for sep in [" | ", " - ", " — ", " – "]:
                     if sep in cleaned:
                         cleaned = cleaned.split(sep)[0].strip()
-                # remove common brand tokens at ends
                 for token in ["glamira", "store", "shop"]:
                     if cleaned.lower().endswith(token):
                         cleaned = cleaned[: -len(token)].strip(" -|•")
@@ -482,8 +372,6 @@ def extract_product_name(html: str) -> Optional[str]:
                     return cleaned
     except Exception:
         pass
-
-    # Try Google Tag Manager dataLayer pushes (often contains sku/name)
     try:
         matches = []
         matches += re.findall(r"window\\.dataLayer\\.push\\((\{[\s\S]*?\})\)\s*;?", html)
@@ -492,7 +380,6 @@ def extract_product_name(html: str) -> Optional[str]:
             try:
                 obj = json.loads(m)
             except Exception:
-                # attempt to fix common trailing commas
                 try:
                     fixed = re.sub(r",\s*([}\]])", r"\1", m)
                     obj = json.loads(fixed)
@@ -510,13 +397,10 @@ def extract_product_name(html: str) -> Optional[str]:
                     return cleaned
     except Exception:
         pass
-
-    # Try window.product structure commonly present on Glamira
     try:
-        win_prod_match = re.search(r"window\\.product\\s*=\\s*\{[\s\S]*?\};", html)
+        win_prod_match = re.search(r"window\\.product\\s*=\\s*\\{[\s\S]*?\\};", html)
         if win_prod_match:
             block = win_prod_match.group(0)
-            # Try to capture sku from a simpler regex
             sku_match = re.search(r"product\\.sku\\s*=\\s*['\"]([^'\"]+)['\"]", block)
             if sku_match:
                 sku_val = sku_match.group(1).strip()
@@ -524,15 +408,10 @@ def extract_product_name(html: str) -> Optional[str]:
                     return sku_val
     except Exception:
         pass
-
-    # Thêm nhiều selector hơn để tìm product name
     selectors = [
-        # Magento specific
         "h1.page-title span.base",
         "h1.page-title",
         ".page-title",
-
-        # Generic product selectors
         "h1.product-title",
         "h1.product-name",
         ".product-title",
@@ -540,25 +419,15 @@ def extract_product_name(html: str) -> Optional[str]:
         ".product-info h1",
         ".product-details h1",
         ".product-header h1",
-
-        # Microdata / Schema markers
         "[itemprop='name']",
-        # Data attributes
         "[data-testid='product-title']",
         "[data-testid='product-name']",
         "[data-role='product-name']",
-
-        # Meta tags
         "meta[property='og:title']",
         "meta[name='title']",
-
-        # Generic h1
         "h1",
-
-        # Title tag
-        "title"
+        "title",
     ]
-
     for sel in selectors:
         try:
             text = None
@@ -570,46 +439,23 @@ def extract_product_name(html: str) -> Optional[str]:
                 el = soup.select_one(sel)
                 if el:
                     text = el.get_text(strip=True)
-
-            if text and len(text) > 3 and len(text) < 300:  # Reasonable length (bump max)
-                # Clean up the text
-                text = text.replace('\n', ' ').replace(
-                    '\t', ' ').replace('\r', ' ')
-                text = ' '.join(text.split())  # Remove extra whitespace
-
-                # strip site suffixes sometimes present in titles
+            if text and len(text) > 3 and len(text) < 300:
+                text = text.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ')
+                text = ' '.join(text.split())
                 for sep in [" | ", " - ", " — ", " – "]:
                     if sep in text:
                         text = text.split(sep)[0].strip()
-
-                # light prefix cleanup for common marketing prefixes
-                marketing_prefixes = [
-                    "Kaufen Sie ",  # de
-                    "Achetez ",     # fr
-                    "Acheter ",
-                    "Buy ",         # en
-                    "Compra ",      # es/it
-                    "Compre ",      # pt
-                ]
+                marketing_prefixes = ["Kaufen Sie ", "Achetez ", "Acheter ", "Buy ", "Compra ", "Compre "]
                 for pref in marketing_prefixes:
                     if text.startswith(pref):
                         text = text[len(pref):].strip()
-
-                # Skip common non-product text
-                skip_phrases = [
-                    "404", "not found", "error", "page not found",
-                    "home", "shop", "store", "catalog", "products"
-                ]
-
+                skip_phrases = ["404", "not found", "error", "page not found", "home", "shop", "store", "catalog", "products"]
                 if not any(phrase in text.lower() for phrase in skip_phrases):
                     return text
-
         except Exception as e:
             logger.debug(f"Error extracting with selector '{sel}': {e}")
             continue
-
     return None
-
 
 
 def _derive_name_from_slug(url: str) -> Optional[str]:
@@ -620,22 +466,15 @@ def _derive_name_from_slug(url: str) -> Optional[str]:
             return None
         slug = path.rsplit('/', 1)[-1]
         slug = slug.split('.html', 1)[0]
-        # remove common prefixes
-        prefixes = [
-            'glamira-', 'bague-', 'ring-', 'anneau-', 'verlobungsring-', 'eheringe-',
-            'pierscionki-', 'prsten-', 'collier-', 'pendant-', 'necklace-', 'earring-'
-        ]
+        prefixes = ['glamira-', 'bague-', 'ring-', 'anneau-', 'verlobungsring-', 'eheringe-', 'pierscionki-', 'prsten-', 'collier-', 'pendant-', 'necklace-', 'earring-']
         for p in prefixes:
             if slug.startswith(p):
                 slug = slug[len(p):]
                 break
-        # normalize hyphens/underscores
         words = [w for w in re.split(r"[-_]+", slug) if w]
         if not words:
             return None
-        # title case but keep numbers and units as-is
         name = " ".join(w.capitalize() if w.isalpha() else w for w in words)
-        # sanity length
         if 2 < len(name) < 200:
             return name
     except Exception:
@@ -644,16 +483,12 @@ def _derive_name_from_slug(url: str) -> Optional[str]:
 
 
 def process_single_url(record: UrlRecord) -> Dict:
-    """Process a single URL and extract product name"""
     global _DEBUG_HTML_SAVED
     html = http_get(record.url)
     product_name = None
     status = "failed"
-
     if html:
-        # Skip non-product pages (e.g., cart) that passed through
         if is_non_product_page(html):
-            # attempt recovery: try canonical URL or strip query params once
             recovered_html = None
             new_url = _extract_canonical_url(html)
             if not new_url:
@@ -662,7 +497,6 @@ def process_single_url(record: UrlRecord) -> Dict:
                     new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
                 except Exception:
                     new_url = None
-
             if new_url and new_url != record.url:
                 recovered_html = http_get(new_url)
                 if recovered_html and not is_non_product_page(recovered_html):
@@ -670,10 +504,7 @@ def process_single_url(record: UrlRecord) -> Dict:
                     record = UrlRecord(product_id=record.product_id, url=new_url, source_collection=record.source_collection)
                 else:
                     recovered_html = None
-
-        # Re-check after potential recovery
         if is_non_product_page(html):
-            # Save debug snapshot too
             if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
                 try:
                     parsed = urlparse(record.url)
@@ -685,74 +516,47 @@ def process_single_url(record: UrlRecord) -> Dict:
                     _DEBUG_HTML_SAVED += 1
                 except Exception:
                     pass
-            return {
-                "product_id": record.product_id,
-                "url": record.url,
-                "source_collection": record.source_collection,
-                "product_name": None,
-                "status": "non_product_page",
-                "fetched_at": int(time.time()),
-            }
+            return {"product_id": record.product_id, "url": record.url, "source_collection": record.source_collection, "product_name": None, "status": "non_product_page", "fetched_at": int(time.time())}
         product_name = extract_product_name(html)
-        if not product_name:
-            # heuristics from URL slug for Glamira-like pages
+        if product_name:
+            status = "success"
+        else:
             slug_name = _derive_name_from_slug(record.url)
             if slug_name:
                 product_name = slug_name
                 status = "slug_heuristic"
             else:
                 status = "no_name_found"
-        else:
-            status = "no_name_found"
-            # Log debug info for failed extractions
-            logger.debug(f"No name found for {record.url[:50]}...")
-            # save a few samples for diagnosis
-            if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
-                try:
-                    parsed = urlparse(record.url)
-                    host = (parsed.hostname or 'unknown').replace(':', '_')
-                    fname = f"debug_html_{host}_{int(time.time())}_{_DEBUG_HTML_SAVED}.html"
-                    with open(fname, 'w', encoding='utf-8') as f:
-                        f.write(html)
-                    logger.info(f"🧪 Saved debug HTML to {fname}")
-                    _DEBUG_HTML_SAVED += 1
-                except Exception:
-                    pass
-        if product_name and status == "no_name_found":
-            status = "success"
+                if _DEBUG_HTML_SAVED < _DEBUG_HTML_MAX:
+                    try:
+                        parsed = urlparse(record.url)
+                        host = (parsed.hostname or 'unknown').replace(':', '_')
+                        fname = f"debug_html_{host}_{int(time.time())}_{_DEBUG_HTML_SAVED}.html"
+                        with open(fname, 'w', encoding='utf-8') as f:
+                            f.write(html)
+                        logger.info(f"🧪 Saved debug HTML to {fname}")
+                        _DEBUG_HTML_SAVED += 1
+                    except Exception:
+                        pass
     else:
         status = "no_html"
         logger.debug(f"No HTML for {record.url[:50]}...")
-
-    return {
-        "product_id": record.product_id,
-        "url": record.url,
-        "source_collection": record.source_collection,
-        "product_name": product_name,
-        "status": status,
-        "fetched_at": int(time.time()),
-    }
+    return {"product_id": record.product_id, "url": record.url, "source_collection": record.source_collection, "product_name": product_name, "status": status, "fetched_at": int(time.time())}
 
 
 def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
     results = []
     total = len(records)
     completed = 0
-
-    # Log memory usage before starting
     initial_memory = get_memory_usage_mb()
-    logger.info(
-        f"🧠 Starting crawl with {total} records. Initial memory: {initial_memory:.1f}MB")
-
+    logger.info(f"🧠 Starting crawl with {total} records. Initial memory: {initial_memory:.1f}MB")
     try:
         progress = tqdm(total=total, desc="Crawling products")
         has_progress_update = hasattr(progress, "update")
     except Exception:
         progress = None
         has_progress_update = False
-
-    log_every = max(1, total // 20) if total > 0 else 1  # ~5% steps
-
+    log_every = max(1, total // 20) if total > 0 else 1
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_single_url, r) for r in records]
         for future in as_completed(futures):
@@ -762,86 +566,52 @@ def crawl_product_names_parallel(records: List[UrlRecord]) -> List[Dict]:
                 logger.warning(f"Error: {e}")
             finally:
                 completed += 1
-
-                # Memory monitoring
                 if completed % log_every == 0 or completed == total:
                     current_memory = get_memory_usage_mb()
                     percent = (completed * 100.0 / total) if total else 100.0
-                    logger.info(
-                        f"⏳ Progress: {completed}/{total} ({percent:.1f}%) - Memory: {current_memory:.1f}MB")
-
-                    # Force GC if memory usage is high
+                    logger.info(f"⏳ Progress: {completed}/{total} ({percent:.1f}%) - Memory: {current_memory:.1f}MB")
                     if check_memory_limit():
                         force_garbage_collection()
-
                 if has_progress_update and progress is not None:
                     try:
                         progress.update(1)
                     except Exception:
                         pass
-
     if progress is not None and hasattr(progress, "close"):
         try:
             progress.close()
         except Exception:
             pass
-
-    # Final memory check
     final_memory = get_memory_usage_mb()
-    logger.info(
-        f"🧠 Finished crawl. Memory: {final_memory:.1f}MB (Δ: {final_memory - initial_memory:+.1f}MB)")
-
+    logger.info(f"🧠 Finished crawl. Memory: {final_memory:.1f}MB (Δ: {final_memory - initial_memory:+.1f}MB)")
     return results
 
 
 def deduplicate_by_product_id(candidates: List[Dict]) -> List[Dict]:
-    """
-    Deduplicate candidates by product_id, keeping only the best result for each product.
-    Prioritizes records with product_name (status='success').
-    """
     if not candidates:
         return []
-    
-    # Group by product_id
     grouped = {}
     for row in candidates:
         pid = row.get("product_id")
         if not pid:
             continue
-            
         status = row.get("status", "unknown")
         has_name = bool(row.get("product_name"))
-        
         if pid not in grouped:
-            # First occurrence
             grouped[pid] = row
         else:
-            # Already have a record for this product_id
             existing_status = grouped[pid].get("status", "unknown")
             existing_has_name = bool(grouped[pid].get("product_name"))
-            
-            # Priority: records with product_name > records without name
             if has_name and not existing_has_name:
-                # New record has name, existing doesn't -> replace
                 grouped[pid] = row
             elif has_name and existing_has_name:
-                # Both have name, keep the one with better status
                 if status == "success" and existing_status != "success":
                     grouped[pid] = row
-                # Otherwise keep existing
-            # If new record has no name, keep existing
-    
-    # Convert back to list
     unique_list = list(grouped.values())
-    
-    # Log deduplication stats
     original_count = len(candidates)
     unique_count = len(unique_list)
     if original_count != unique_count:
-        logger.info(
-            f"🔗 Deduplicated: {original_count} -> {unique_count} unique products "
-            f"(removed {original_count - unique_count} duplicates)")
-    
+        logger.info(f"🔗 Deduplicated: {original_count} -> {unique_count} unique products (removed {original_count - unique_count} duplicates)")
     return unique_list
 
 
@@ -854,25 +624,18 @@ def append_candidates_jsonl(candidates: List[Dict], path: str = CANDIDATES_JSONL
 def append_final_csv(candidates: List[Dict], path: str = FINAL_CSV) -> None:
     file_exists = os.path.exists(path)
     with open(path, "a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-                                "product_id", "product_name", "url", "source_collection", "status", "fetched_at"])
+        writer = csv.DictWriter(f, fieldnames=["product_id", "product_name", "url", "source_collection", "status", "fetched_at"])
         if not file_exists:
             writer.writeheader()
         writer.writerows(candidates)
 
-# -----------------------------
-# Main
-# -----------------------------
 
+# Main loop
 
 def main():
-    # Count total products without loading all data
     total_expected = count_total_products_streaming()
-    logger.info(
-        f"📊 Total distinct product IDs from filtered data: {total_expected}")
+    logger.info(f"📊 Total distinct product IDs from filtered data: {total_expected}")
     logger.info(f"🧠 Initial memory usage: {get_memory_usage_mb():.1f}MB")
-
-    # Load existing processed products (skip if FORCE_PROCESS)
     existing_pids = set()
     if not FORCE_PROCESS and os.path.exists(FINAL_CSV):
         with open(FINAL_CSV, "r", encoding="utf-8") as f:
@@ -882,93 +645,51 @@ def main():
         logger.info(f"📋 Found {len(existing_pids)} already processed products")
     elif FORCE_PROCESS:
         logger.info("🔄 FORCE_PROCESS enabled - will process all products")
-
     total_processed = 0
     total_with_name = 0
     batch_count = 0
-
-    # Process data in streaming batches
     for batch_data in stream_filtered_data_batches(batch_size=BATCH_SIZE):
         batch_count += 1
-
-        # Filter out already processed products
         original_batch_size = len(batch_data)
-        batch_data = [record for record in batch_data
-                      if record.get('product_id') not in existing_pids]
+        batch_data = [record for record in batch_data if record.get('product_id') not in existing_pids]
         filtered_batch_size = len(batch_data)
-
-        logger.info(
-            f"📊 Batch {batch_count}: {original_batch_size} -> {filtered_batch_size} products (filtered: {original_batch_size - filtered_batch_size})")
-
+        logger.info(f"📊 Batch {batch_count}: {original_batch_size} -> {filtered_batch_size} products (filtered: {original_batch_size - filtered_batch_size})")
         if not batch_data:
-            logger.info(
-                f"⏭️ Batch {batch_count}: All products already processed, skipping")
+            logger.info(f"⏭️ Batch {batch_count}: All products already processed, skipping")
             continue
-
-        logger.info(
-            f"🔄 Processing batch {batch_count} with {len(batch_data)} products...")
+        logger.info(f"🔄 Processing batch {batch_count} with {len(batch_data)} products...")
         logger.info(f"🧠 Memory before batch: {get_memory_usage_mb():.1f}MB")
-
-        # Convert batch data to URL records
         url_records = process_batch_data(batch_data)
-
         if not url_records:
-            logger.warning(
-                f"⚠️ Batch {batch_count}: No valid URL records found")
+            logger.warning(f"⚠️ Batch {batch_count}: No valid URL records found")
             continue
-
-        # Process URLs in parallel
         candidates = crawl_product_names_parallel(url_records)
-
-        # Deduplicate by product_id (keep best result per product)
         unique_candidates = deduplicate_by_product_id(candidates)
-
-        # Save results
-        append_candidates_jsonl(candidates)  # Save all results to JSONL
-        # Only write rows that actually have a product_name to the final CSV
+        append_candidates_jsonl(candidates)
         named_only = [row for row in unique_candidates if row.get("product_name")]
         if named_only:
-            append_final_csv(named_only)  # Save only products with names to CSV
-
-        # Update existing_pids to track processed products
+            append_final_csv(named_only)
         for row in unique_candidates:
             existing_pids.add(row.get("product_id"))
-
-        # Update statistics (use unique_candidates for accurate counts)
         processed_batch = len(unique_candidates)
         with_name_batch = len(named_only)
-
-        # Thống kê chi tiết (use unique_candidates for status breakdown)
         status_counts = {}
         for row in unique_candidates:
             status = row.get("status", "unknown")
             status_counts[status] = status_counts.get(status, 0) + 1
-
         total_processed += processed_batch
         total_with_name += with_name_batch
-
-        percent = (total_processed / total_expected) * \
-            100 if total_expected else 0
-
-        logger.info(
-            f"✅ Finished batch {batch_count}. Processed: {processed_batch}, With names: {with_name_batch}")
-        logger.info(
-            f"📊 Total progress: {total_processed}/{total_expected} ({percent:.2f}% done)")
+        percent = (total_processed / total_expected) * 100 if total_expected else 0
+        logger.info(f"✅ Finished batch {batch_count}. Processed: {processed_batch}, With names: {with_name_batch}")
+        logger.info(f"📊 Total progress: {total_processed}/{total_expected} ({percent:.2f}% done)")
         logger.info(f"📊 Status breakdown: {status_counts}")
         logger.info(f"🧠 Memory after batch: {get_memory_usage_mb():.1f}MB")
-
-        # Force garbage collection after each batch
         force_garbage_collection()
-
-        # Check if we should pause due to memory
         if check_memory_limit():
             logger.warning("⚠️ Memory limit reached, forcing cleanup...")
-            time.sleep(2)  # Brief pause to let system recover
-
-    logger.info(
-        f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
+            time.sleep(2)
+    logger.info(f"🎯 DONE! {total_with_name}/{total_expected} products crawled successfully.")
     logger.info(f"🧠 Final memory usage: {get_memory_usage_mb():.1f}MB")
-
 
 if __name__ == "__main__":
     main()
